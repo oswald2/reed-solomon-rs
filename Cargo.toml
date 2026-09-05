@@ -1,0 +1,25 @@
+[package]
+name = "reed-solomon-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Michael Oswald"]
+license = "BSD-2-Clause"
+description = "Reed-Solomon encoding/decoding over GF(2^k), k <= 8, ported from libcorrect's short_rs branch. Includes CCSDS conformance presets (AOS Frame Header Error Control, TM Synchronization and Channel Coding)."
+repository = "https://github.com/quiet/libcorrect"
+readme = "README.md"
+keywords = ["reed-solomon", "fec", "ccsds", "no_std", "error-correction"]
+categories = ["algorithms", "no-std", "encoding"]
+
+[lib]
+name = "reed_solomon_rs"
+
+[features]
+default = []
+# Enables std::error::Error impls and anything else that needs libstd.
+# The crate itself is no_std + alloc regardless of this feature.
+std = []
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"
