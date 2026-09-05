@@ -26,8 +26,12 @@ current progress.
 - [x] Phase 3: RS construction + systematic encode
 - [x] Phase 4: RS decode (Berlekamp-Massey, Chien search, Forney)
 - [x] Phase 5: RS decode with erasures
-- [ ] Phase 6: CCSDS conformance presets (AOS FHEC, TM channel coding,
-      interleaving, dual-basis conversion)
+- [x] Phase 6a: CCSDS AOS Frame Header Error Control preset
+      (`ccsds::fhec`), verified against CCSDS 732.0-B-4's own published
+      generator polynomial
+- [ ] Phase 6b: CCSDS TM Synchronization and Channel Coding preset
+      (RS(255,223), interleaving, dual-basis conversion) -- not yet
+      started; needs its own pass through CCSDS 131.0-B
 
 ## License
 

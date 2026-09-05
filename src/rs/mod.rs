@@ -224,6 +224,14 @@ impl ReedSolomon {
         &self.generator_roots
     }
 
+    /// The generator polynomial itself, `product(x + generator_roots[i])`,
+    /// coefficients ordered lowest to highest degree. Useful mainly for
+    /// checking a construction against a spec's own published generator
+    /// polynomial (as `ccsds::fhec`'s tests do against CCSDS 732.0-B-4).
+    pub fn generator(&self) -> &[u8] {
+        &self.generator
+    }
+
     /// Encodes `msg` (`msg.len() <= message_length()`) into `encoded`,
     /// which must have room for at least `msg.len() + min_distance()`
     /// bytes (the C implementation does not check this, and will write
@@ -754,10 +762,13 @@ mod tests {
 
     #[test]
     fn encode_returns_actual_bytes_written_for_a_shortened_code() {
-        // The motivating case (quiet/libcorrect#17): a GF(16) code
-        // shortened well below its natural message_length, as CCSDS AOS
-        // FHEC's RS(10,6) shortens the natural (15,11) code down from
-        // 11-symbol messages to 6.
+        // Shaped like the motivating case (quiet/libcorrect#17): a
+        // GF(16) code shortened well below its natural message_length,
+        // the same way CCSDS AOS FHEC's RS(10,6) shortens its natural
+        // (15,11) code down from 11-symbol messages to 6 (root
+        // convention doesn't matter for this particular check, so this
+        // uses 1/1 rather than CCSDS's actual 6/1 -- see
+        // src/ccsds/fhec.rs for the spec-exact preset).
         let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
         assert_eq!(rs.message_length(), 11);
         let msg = [1u8, 2, 3, 4, 5, 6];
@@ -768,9 +779,13 @@ mod tests {
 
     #[test]
     fn ccsds_aos_fhec_shortened_rs_10_6_produces_a_valid_codeword() {
-        // CCSDS 732.0-B AOS Frame Header Error Control: shortened
-        // RS(10,6) over GF(16), primitive polynomial 0x13.
-        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        // CCSDS 732.0-B-4 SS4.1.2.6.5: shortened RS(10,6) over GF(16),
+        // primitive polynomial x^4+x+1 (0x13), generator roots
+        // alpha^6..alpha^9 (first_consecutive_root=6, generator_root_gap=1).
+        // See src/ccsds/fhec.rs for the spec-verified preset and its own
+        // conformance test against the standard's published generator
+        // polynomial.
+        let mut rs = ReedSolomon::new(POLY_GF16, 6, 1, 4).unwrap();
         let msg = [3u8, 7, 1, 15, 0, 9];
         let mut encoded = [0u8; 10];
         let written = rs.encode(&msg, &mut encoded).unwrap();
@@ -821,9 +836,10 @@ mod tests {
 
     #[test]
     fn ccsds_aos_fhec_round_trips_through_encode_and_decode() {
-        // The quiet/libcorrect#17 case itself: GF(16), min_distance 4,
-        // a message shortened to 6 symbols (RS(10,6)).
-        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        // The quiet/libcorrect#17 case itself, with the actual CCSDS
+        // 732.0-B-4 SS4.1.2.6.5 parameters: GF(16), generator roots
+        // alpha^6..alpha^9, a message shortened to 6 symbols (RS(10,6)).
+        let mut rs = ReedSolomon::new(POLY_GF16, 6, 1, 4).unwrap();
         let msg = [3u8, 7, 1, 15, 0, 9];
         let mut encoded = [0u8; 10];
         rs.encode(&msg, &mut encoded).unwrap();
@@ -971,8 +987,9 @@ mod tests {
     fn ccsds_aos_fhec_recovers_via_pure_erasures() {
         // min_distance = 4 allows up to 3 (min_distance - 1) erasures
         // when their locations are fully known, more than the 2 errors
-        // decode() alone could correct blind.
-        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        // decode() alone could correct blind. Uses the real CCSDS
+        // 732.0-B-4 SS4.1.2.6.5 generator roots (alpha^6..alpha^9).
+        let mut rs = ReedSolomon::new(POLY_GF16, 6, 1, 4).unwrap();
         let msg = [3u8, 7, 1, 15, 0, 9];
         let mut encoded = [0u8; 10];
         rs.encode(&msg, &mut encoded).unwrap();
@@ -992,7 +1009,7 @@ mod tests {
     fn ccsds_aos_fhec_recovers_via_mixed_errors_and_erasures() {
         // 2*num_errors + num_erasures < min_distance (4): 1 unknown
         // error plus 1 known erasure fits (2*1 + 1 == 3 < 4).
-        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        let mut rs = ReedSolomon::new(POLY_GF16, 6, 1, 4).unwrap();
         let msg = [3u8, 7, 1, 15, 0, 9];
         let mut encoded = [0u8; 10];
         rs.encode(&msg, &mut encoded).unwrap();

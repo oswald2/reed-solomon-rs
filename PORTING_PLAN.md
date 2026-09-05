@@ -65,10 +65,22 @@ layer, CCSDS TC (which uses BCH, not RS).
    Forney error values, each as its own module.
 5. Decode with erasures: modified syndromes, erasure-locator-from-roots,
    combined error+erasure Forney step.
-6. CCSDS conformance layer: `ccsds::fhec`, `ccsds::tm_channel_coding`
-   (+ interleaving), `ccsds::dual_basis`. Root conventions
-   (`first_consecutive_root`, `generator_root_gap`) for each standardized
-   code must be verified against the actual CCSDS blue books, not assumed.
+6. CCSDS conformance layer:
+   a. `ccsds::fhec` (done) -- CCSDS 732.0-B-4 SS4.1.2.6.5, AOS Frame
+      Header Error Control. Verified (not assumed) against the standard
+      itself: fetched the actual PDF, confirmed `F(x) = x^4 + x + 1`
+      (`0x13`) and generator roots `alpha^6..alpha^9`
+      (`first_consecutive_root = 6`, `generator_root_gap = 1`, contrary
+      to an earlier unverified guess of `1` elsewhere in this crate's
+      test suite), and cross-checked our `ReedSolomon::generator()`
+      output against the standard's own published `g(x)` coefficients
+      byte-for-byte -- see `ccsds::fhec`'s
+      `generator_polynomial_matches_the_published_standard` test.
+   b. `ccsds::tm_channel_coding` (+ interleaving) and `ccsds::dual_basis`
+      -- not started. CCSDS 131.0-B's RS(255,223) root convention,
+      interleaving depths, and the dual-basis <-> conventional-basis
+      symbol conversion table all need the same fetch-and-verify
+      treatment phase 6a got, not assumption.
 
 ## Correctness strategy
 
