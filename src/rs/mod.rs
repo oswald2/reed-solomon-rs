@@ -73,6 +73,27 @@ pub struct ReedSolomon {
     error_evaluator: Vec<u8>,     // len == min_distance; forney scratch
     error_locator_derivative: Vec<u8>, // len == min_distance; forney scratch
     error_vals: Vec<u8>,          // len == min_distance
+
+    // Erasure-decoding-only scratch (see `decode_with_erasures`).
+    erasure_locator: Vec<u8>,     // len == min_distance + 1
+    /// The combined locator (erasures and any additional errors found
+    /// beyond them), `erasure_locator * error_locator`. Kept as a
+    /// separate buffer from `error_locator` rather than reusing it in
+    /// place (as the C implementation's pointer-swapping does), since
+    /// both are needed simultaneously and this is far easier to follow.
+    combined_locator: Vec<u8>,    // len == min_distance + 1
+    modified_syndromes: Vec<u8>,  // len == min_distance
+    /// A snapshot of the true syndromes, taken before they're
+    /// temporarily overwritten (shifted by the modified-syndrome
+    /// technique) to run Berlekamp-Massey on the erasure-adjusted
+    /// sequence; restored before Forney's algorithm runs, which needs
+    /// the real syndromes.
+    syndrome_snapshot: Vec<u8>,   // len == min_distance
+    /// Ping-pong scratch for `polynomial::init_from_roots`, used to
+    /// build `erasure_locator` from the caller-supplied erasure
+    /// locations without allocating.
+    init_from_roots_scratch: [Vec<u8>; 2], // each len == min_distance + 1
+
     /// `generator_root_exp[i]` holds the successive log-powers of
     /// `generator_roots[i]`, `block_length` of them: used to evaluate
     /// the received polynomial at each generator root (i.e. compute
@@ -153,6 +174,11 @@ impl ReedSolomon {
             error_evaluator: vec![0u8; min_distance],
             error_locator_derivative: vec![0u8; min_distance],
             error_vals: vec![0u8; min_distance],
+            erasure_locator: vec![0u8; min_distance + 1],
+            combined_locator: vec![0u8; min_distance + 1],
+            modified_syndromes: vec![0u8; min_distance],
+            syndrome_snapshot: vec![0u8; min_distance],
+            init_from_roots_scratch: [vec![0u8; min_distance + 1], vec![0u8; min_distance + 1]],
             generator_root_exp,
             element_exp,
             field,
@@ -388,6 +414,196 @@ impl ReedSolomon {
         );
 
         for i in 0..order {
+            let location = self.error_locations[i] as usize;
+            self.received_polynomial[location] =
+                self.field.sub(self.received_polynomial[location], self.error_vals[i]);
+        }
+
+        for (dst, &src) in msg[..msg_length]
+            .iter_mut()
+            .zip(self.received_polynomial[..encoded.len()].iter().rev())
+        {
+            *dst = src;
+        }
+        Ok(msg_length)
+    }
+
+    /// Like [`ReedSolomon::decode`], but additionally accepts
+    /// `erasure_locations`: byte indices into `encoded` that the caller
+    /// already suspects are corrupted (e.g. flagged by a demodulator's
+    /// confidence signal). Knowing *where* some errors are, rather than
+    /// having to find them, buys more total correction capacity: this
+    /// can recover from any mix of erasures and (unlocated) errors
+    /// satisfying `2 * num_errors + erasure_locations.len() <
+    /// min_distance()`, versus plain `decode`'s `2 * num_errors <
+    /// min_distance()`.
+    ///
+    /// If `erasure_locations` is empty, this is exactly
+    /// [`ReedSolomon::decode`]. Otherwise, `erasure_locations.len()`
+    /// must not exceed `min_distance()`, and every entry must be a valid
+    /// index into `encoded` (`< encoded.len()`).
+    ///
+    /// Returns the number of bytes written to `msg`,
+    /// `encoded.len() - min_distance()`, same as `decode`.
+    pub fn decode_with_erasures(
+        &mut self,
+        encoded: &[u8],
+        erasure_locations: &[u8],
+        msg: &mut [u8],
+    ) -> Result<usize, RsError> {
+        if erasure_locations.is_empty() {
+            return self.decode(encoded, msg);
+        }
+        if encoded.len() > self.block_length {
+            return Err(RsError::EncodedTooLong);
+        }
+        if encoded.len() < self.min_distance {
+            return Err(RsError::EncodedTooShort);
+        }
+        if erasure_locations.len() > self.min_distance {
+            return Err(RsError::TooManyErasures);
+        }
+        let msg_length = encoded.len() - self.min_distance;
+        if msg.len() < msg_length {
+            return Err(RsError::BufferTooSmall);
+        }
+        let erasure_length = erasure_locations.len();
+
+        // Same setup as decode(): undo the high-to-low reversal, and
+        // zero-fill the (unshortened) padding region.
+        for (dst, &src) in self.received_polynomial[..encoded.len()]
+            .iter_mut()
+            .zip(encoded.iter().rev())
+        {
+            if src > self.field.largest_element() {
+                return Err(RsError::InvalidSymbol);
+            }
+            *dst = src;
+        }
+        for slot in self.received_polynomial[encoded.len()..self.block_length].iter_mut() {
+            *slot = 0;
+        }
+
+        // Map each erasure's byte index (in encoded's high-to-low byte
+        // order) to the low-to-high polynomial coefficient index used
+        // internally, then convert those positions into error roots and
+        // multiply them out into the erasure locator polynomial.
+        for (i, &loc) in erasure_locations.iter().enumerate() {
+            if loc as usize >= encoded.len() {
+                return Err(RsError::InvalidErasureLocation);
+            }
+            self.error_locations[i] = (encoded.len() - 1 - loc as usize) as u8;
+        }
+        chien::find_error_roots_from_locations(
+            &self.field,
+            self.generator_root_gap,
+            &self.error_locations[..erasure_length],
+            &mut self.error_roots[..erasure_length],
+        );
+        polynomial::init_from_roots(
+            &self.field,
+            &self.error_roots[..erasure_length],
+            &mut self.erasure_locator[..=erasure_length],
+            &mut self.init_from_roots_scratch,
+        );
+
+        let all_zero = find_syndromes(
+            &self.field,
+            &self.received_polynomial,
+            &self.generator_root_exp,
+            &mut self.syndromes,
+        );
+        if all_zero {
+            // The received block is already a valid codeword, whatever
+            // was flagged as erased notwithstanding.
+            for (dst, &src) in msg[..msg_length]
+                .iter_mut()
+                .zip(self.received_polynomial[..encoded.len()].iter().rev())
+            {
+                *dst = src;
+            }
+            return Ok(msg_length);
+        }
+
+        // The modified-syndrome technique: multiplying the syndrome
+        // polynomial by the (already-known) erasure locator produces a
+        // sequence whose first erasure_length terms are eliminated,
+        // leaving min_distance - erasure_length usable terms that
+        // Berlekamp-Massey can run on to find any *additional* errors
+        // beyond the known erasures. Since this overwrites `syndromes`
+        // in place, save the real syndromes first -- Forney's algorithm
+        // needs those, not the modified ones.
+        self.syndrome_snapshot.copy_from_slice(&self.syndromes);
+        polynomial::mul(
+            &self.field,
+            &self.erasure_locator[..=erasure_length],
+            &self.syndromes,
+            &mut self.modified_syndromes,
+        );
+        let remaining = self.min_distance - erasure_length;
+        for i in 0..remaining {
+            self.syndromes[i] = self.modified_syndromes[erasure_length + i];
+        }
+
+        let order = berlekamp_massey::find_error_locator(
+            &self.field,
+            &self.syndromes,
+            erasure_length,
+            &mut self.error_locator,
+            &mut self.last_error_locator,
+        );
+
+        for i in 0..=order {
+            self.error_locator_log[i] = self.field.log_table()[self.error_locator[i] as usize];
+        }
+
+        if !chien::factorize_error_locator(
+            &self.field,
+            erasure_length,
+            &self.error_locator_log[..=order],
+            &mut self.error_roots,
+            &self.element_exp,
+        ) {
+            // Consistent with too-many-errors detection in decode():
+            // the found root count didn't match the locator's degree.
+            return Err(RsError::TooManyErrors);
+        }
+
+        // The full error locator -- covering both the known erasures and
+        // whatever additional errors were just found -- is the product
+        // of the two.
+        let combined_order = erasure_length + order;
+        polynomial::mul(
+            &self.field,
+            &self.erasure_locator[..=erasure_length],
+            &self.error_locator[..=order],
+            &mut self.combined_locator[..=combined_order],
+        );
+
+        chien::find_error_locations(
+            &self.field,
+            self.generator_root_gap,
+            &self.error_roots[..combined_order],
+            &mut self.error_locations[..combined_order],
+        );
+
+        // Restore the real syndromes before Forney's algorithm, which
+        // needs them (not the modified ones used above).
+        self.syndromes.copy_from_slice(&self.syndrome_snapshot);
+
+        forney::find_error_values(
+            &self.field,
+            &self.combined_locator[..=combined_order],
+            &self.syndromes,
+            &self.error_roots[..combined_order],
+            self.first_consecutive_root,
+            &self.element_exp,
+            &mut self.error_evaluator,
+            &mut self.error_locator_derivative[..combined_order],
+            &mut self.error_vals[..combined_order],
+        );
+
+        for i in 0..combined_order {
             let location = self.error_locations[i] as usize;
             self.received_polynomial[location] =
                 self.field.sub(self.received_polynomial[location], self.error_vals[i]);
@@ -706,6 +922,175 @@ mod tests {
 
             let mut recovered = vec![0u8; msg.len()];
             let n = rs.decode(&encoded, &mut recovered).unwrap();
+            prop_assert_eq!(n, msg.len());
+            prop_assert_eq!(recovered, msg);
+        }
+    }
+
+    #[test]
+    fn decode_with_erasures_with_no_erasures_matches_decode() {
+        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        let msg = [3u8, 7, 1, 15, 0, 9];
+        let mut encoded = [0u8; 10];
+        rs.encode(&msg, &mut encoded).unwrap();
+        encoded[2] ^= 0x05;
+
+        let mut recovered = [0u8; 6];
+        let n = rs.decode_with_erasures(&encoded, &[], &mut recovered).unwrap();
+        assert_eq!(n, msg.len());
+        assert_eq!(recovered, msg);
+    }
+
+    #[test]
+    fn decode_with_erasures_rejects_too_many_erasures() {
+        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        let encoded = [0u8; 10];
+        let erasures = [0u8, 1, 2, 3, 4]; // 5 > min_distance (4)
+        let mut recovered = [0u8; 6];
+        assert_eq!(
+            rs.decode_with_erasures(&encoded, &erasures, &mut recovered),
+            Err(RsError::TooManyErasures)
+        );
+    }
+
+    #[test]
+    fn decode_with_erasures_rejects_out_of_range_location() {
+        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        let msg = [3u8, 7, 1, 15, 0, 9];
+        let mut encoded = [0u8; 10];
+        rs.encode(&msg, &mut encoded).unwrap();
+
+        let mut recovered = [0u8; 6];
+        assert_eq!(
+            rs.decode_with_erasures(&encoded, &[10], &mut recovered), // encoded.len() == 10
+            Err(RsError::InvalidErasureLocation)
+        );
+    }
+
+    #[test]
+    fn ccsds_aos_fhec_recovers_via_pure_erasures() {
+        // min_distance = 4 allows up to 3 (min_distance - 1) erasures
+        // when their locations are fully known, more than the 2 errors
+        // decode() alone could correct blind.
+        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        let msg = [3u8, 7, 1, 15, 0, 9];
+        let mut encoded = [0u8; 10];
+        rs.encode(&msg, &mut encoded).unwrap();
+
+        encoded[0] ^= 0x0a;
+        encoded[4] ^= 0x03;
+        encoded[9] ^= 0x0c;
+        let erasures = [0u8, 4, 9];
+
+        let mut recovered = [0u8; 6];
+        let n = rs.decode_with_erasures(&encoded, &erasures, &mut recovered).unwrap();
+        assert_eq!(n, msg.len());
+        assert_eq!(recovered, msg);
+    }
+
+    #[test]
+    fn ccsds_aos_fhec_recovers_via_mixed_errors_and_erasures() {
+        // 2*num_errors + num_erasures < min_distance (4): 1 unknown
+        // error plus 1 known erasure fits (2*1 + 1 == 3 < 4).
+        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        let msg = [3u8, 7, 1, 15, 0, 9];
+        let mut encoded = [0u8; 10];
+        rs.encode(&msg, &mut encoded).unwrap();
+
+        encoded[3] ^= 0x0a; // known erasure
+        encoded[7] ^= 0x05; // unlocated error
+        let erasures = [3u8];
+
+        let mut recovered = [0u8; 6];
+        let n = rs.decode_with_erasures(&encoded, &erasures, &mut recovered).unwrap();
+        assert_eq!(n, msg.len());
+        assert_eq!(recovered, msg);
+    }
+
+    /// Corrupts up to `num_erasures + num_errors` distinct positions in
+    /// `encoded` (same position-selection scheme as `corrupt`), and
+    /// returns the byte indices of the first `num_erasures` of them --
+    /// the subset a caller would already know about and pass to
+    /// `decode_with_erasures`. The rest are corrupted the same way but
+    /// their locations aren't returned, standing in for unlocated
+    /// errors. If fewer than `num_erasures + num_errors` distinct
+    /// positions were available from `raw_positions`, fewer total
+    /// corruptions happen (which can only make recovery easier); callers
+    /// should assert the returned erasure count actually matches
+    /// `num_erasures` before relying on the error count too.
+    fn corrupt_with_erasures(
+        encoded: &mut [u8],
+        num_erasures: usize,
+        num_errors: usize,
+        raw_positions: &[u16],
+        values: &[u8],
+    ) -> Vec<u8> {
+        let total = num_erasures + num_errors;
+        let mut positions: Vec<usize> = Vec::new();
+        for &p in raw_positions {
+            if positions.len() >= total || positions.len() >= values.len() {
+                break;
+            }
+            let pos = (p as usize) % encoded.len();
+            if !positions.contains(&pos) {
+                positions.push(pos);
+            }
+        }
+        for (i, &pos) in positions.iter().enumerate() {
+            encoded[pos] ^= values[i];
+        }
+        positions.iter().take(num_erasures).map(|&p| p as u8).collect()
+    }
+
+    proptest! {
+        /// Mirrors tests/rs_tester.c's combined errors+erasures case:
+        /// erasures alone, up to the provable maximum (min_distance - 1).
+        #[test]
+        fn decode_with_erasures_recovers_pure_erasures_gf16(
+            min_distance in 2usize..14,
+            msg in proptest::collection::vec(0u8..=15u8, 0..13),
+            raw_positions in proptest::collection::vec(any::<u16>(), 0..14),
+            values in proptest::collection::vec(1u8..=15u8, 0..14),
+        ) {
+            let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, min_distance).unwrap();
+            prop_assume!(msg.len() <= rs.message_length());
+            let num_erasures = min_distance - 1;
+            prop_assume!(num_erasures > 0);
+
+            let mut encoded = vec![0u8; msg.len() + rs.min_distance()];
+            rs.encode(&msg, &mut encoded).unwrap();
+            let erasure_locations = corrupt_with_erasures(&mut encoded, num_erasures, 0, &raw_positions, &values);
+            prop_assume!(erasure_locations.len() == num_erasures);
+
+            let mut recovered = vec![0u8; msg.len()];
+            let n = rs.decode_with_erasures(&encoded, &erasure_locations, &mut recovered).unwrap();
+            prop_assert_eq!(n, msg.len());
+            prop_assert_eq!(recovered, msg);
+        }
+
+        /// Mirrors tests/rs_tester.c's combined errors+erasures case: a
+        /// roughly even split of the min_distance budget between known
+        /// erasures and unlocated errors.
+        #[test]
+        fn decode_with_erasures_recovers_mixed_errors_and_erasures_gf16(
+            min_distance in 3usize..14,
+            msg in proptest::collection::vec(0u8..=15u8, 0..13),
+            raw_positions in proptest::collection::vec(any::<u16>(), 0..14),
+            values in proptest::collection::vec(1u8..=15u8, 0..14),
+        ) {
+            let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, min_distance).unwrap();
+            prop_assume!(msg.len() <= rs.message_length());
+            let num_erasures = min_distance / 2;
+            let num_errors = (min_distance - 1 - num_erasures) / 2;
+            prop_assume!(num_errors > 0);
+
+            let mut encoded = vec![0u8; msg.len() + rs.min_distance()];
+            rs.encode(&msg, &mut encoded).unwrap();
+            let erasure_locations = corrupt_with_erasures(&mut encoded, num_erasures, num_errors, &raw_positions, &values);
+            prop_assume!(erasure_locations.len() == num_erasures);
+
+            let mut recovered = vec![0u8; msg.len()];
+            let n = rs.decode_with_erasures(&encoded, &erasure_locations, &mut recovered).unwrap();
             prop_assert_eq!(n, msg.len());
             prop_assert_eq!(recovered, msg);
         }

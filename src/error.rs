@@ -40,12 +40,20 @@ pub enum RsError {
     /// doesn't check this, and computes the message length as an
     /// unsigned underflow instead of failing.
     EncodedTooShort,
-    /// Decoding failed: there were more errors (and, once erasure
-    /// decoding lands, erasures) than this code's `min_distance()` can
-    /// guarantee recovery from. As in the C implementation, it's
-    /// possible but unlikely for this to go undetected and instead
-    /// return an incorrectly "recovered" message.
+    /// Decoding failed: there were more errors and/or erasures than this
+    /// code's `min_distance()` can guarantee recovery from. As in the C
+    /// implementation, it's possible but unlikely for this to go
+    /// undetected and instead return an incorrectly "recovered" message.
     TooManyErrors,
+    /// The number of erasures passed to `decode_with_erasures` exceeds
+    /// this code's `min_distance()`, leaving no room for Berlekamp-Massey
+    /// to run at all.
+    TooManyErasures,
+    /// One of the erasure locations passed to `decode_with_erasures` is
+    /// not a valid index into the encoded block (i.e. is `>= encoded.len()`).
+    /// The C implementation doesn't check this, and silently computes a
+    /// nonsensical position via unsigned underflow instead of failing.
+    InvalidErasureLocation,
 }
 
 impl fmt::Display for RsError {
@@ -60,6 +68,8 @@ impl fmt::Display for RsError {
             RsError::EncodedTooLong => "encoded block is longer than this code's block length",
             RsError::EncodedTooShort => "encoded block is shorter than this code's min_distance",
             RsError::TooManyErrors => "too many errors to recover from",
+            RsError::TooManyErasures => "too many erasures for this code's min_distance",
+            RsError::InvalidErasureLocation => "an erasure location is out of range for the encoded block",
         };
         f.write_str(msg)
     }

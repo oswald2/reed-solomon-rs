@@ -40,6 +40,13 @@ layer, CCSDS TC (which uses BCH, not RS).
   itself simple and independently testable. The scratch-buffer reuse this
   was for happens in the RS decoder (phase 4+), which owns the buffers and
   slices into them.
+- Where the C decoder reuses a single buffer for two different meanings
+  at different points in a call (e.g. `decode_with_erasures` swapping
+  `rs->error_locator` for a combined-locator buffer via pointer
+  assignment, then swapping back), the Rust port just uses two
+  separate, clearly-named persistent buffers instead. Slightly more
+  memory (all buffers here are already tiny -- at most a few hundred
+  bytes even for GF(256)), no swap-back bookkeeping to get wrong.
 
 ## Phases
 

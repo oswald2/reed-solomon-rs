@@ -25,7 +25,7 @@ current progress.
 - [x] Phase 2: `polynomial` — polynomial operations over a field
 - [x] Phase 3: RS construction + systematic encode
 - [x] Phase 4: RS decode (Berlekamp-Massey, Chien search, Forney)
-- [ ] Phase 5: RS decode with erasures
+- [x] Phase 5: RS decode with erasures
 - [ ] Phase 6: CCSDS conformance presets (AOS FHEC, TM channel coding,
       interleaving, dual-basis conversion)
 

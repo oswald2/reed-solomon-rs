@@ -82,6 +82,30 @@ pub(crate) fn find_error_locations(
     }
 }
 
+/// The inverse of [`find_error_locations`]: given known codeword
+/// positions (erasures, whose locations the receiver already knows by
+/// some means outside this codec -- e.g. from a demodulator's confidence
+/// signal), computes the error roots those positions correspond to, so
+/// an erasure locator polynomial can be built from them via
+/// [`crate::polynomial::init_from_roots`].
+///
+/// A codeword position `p` and its corresponding root are related by
+/// `root = 1 / alpha^(generator_root_gap * p)`; recovering `root` from
+/// `p` is thus direct exponentiation, unlike `find_error_locations`'s
+/// brute-force search in the other direction.
+pub(crate) fn find_error_roots_from_locations(
+    field: &GaloisField,
+    generator_root_gap: u8,
+    error_locations: &[u8],
+    error_roots: &mut [u8],
+) {
+    for (root, &location) in error_roots.iter_mut().zip(error_locations.iter()) {
+        let alpha_to_location = field.exp_table()[location as usize];
+        let loc = field.pow(alpha_to_location, generator_root_gap as i32);
+        *root = field.div(1, loc);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +193,23 @@ mod tests {
             let mut locations = [0u8];
             find_error_locations(&gf, generator_root_gap, &[root], &mut locations);
             assert_eq!(locations[0], location, "mismatch for location {location}");
+        }
+    }
+
+    #[test]
+    fn find_error_roots_from_locations_is_the_exact_inverse_of_find_error_locations() {
+        let gf = GaloisField::new(POLY_GF16);
+        let generator_root_gap = 1u8;
+        for location in 0u8..15 {
+            let mut roots = [0u8];
+            find_error_roots_from_locations(&gf, generator_root_gap, &[location], &mut roots);
+
+            let mut recovered_location = [0u8];
+            find_error_locations(&gf, generator_root_gap, &roots, &mut recovered_location);
+            assert_eq!(
+                recovered_location[0], location,
+                "round trip failed for location {location}"
+            );
         }
     }
 }
