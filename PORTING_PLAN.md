@@ -121,5 +121,9 @@ layer, CCSDS TC (which uses BCH, not RS).
 ## Stretch (not in v1)
 
 - Port `tools/find_rs_primitive_poly.c` as an example/binary.
-- `criterion` benchmarks.
+- `criterion` benchmarks (done) -- `benches/rs_benchmarks.rs`, cross-
+  checked against the C implementation with a throwaway harness. See
+  `BENCHMARKS.md` for the methodology and results (Rust is within
+  ~1.5x of C across the board, and roughly tied on the GF(16) FHEC
+  code, the actual motivating use case).
 - SIMD field ops (no C equivalent to port from; new work).
