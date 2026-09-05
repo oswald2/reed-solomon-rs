@@ -8,10 +8,13 @@
 //! Reed-Solomon codes CCSDS standardizes -- see [`ccsds`].
 //!
 //! Ported: [`field`] (GF(2^k) construction and arithmetic), [`polynomial`]
-//! (polynomial arithmetic over a field), and [`rs`] (codec construction,
-//! systematic encode, and decode with and without erasures). See
-//! `PORTING_PLAN.md` for what's still to come (CCSDS 131.0-B TM channel
-//! coding, interleaving, dual-basis representation).
+//! (polynomial arithmetic over a field), [`rs`] (codec construction,
+//! systematic encode, and decode with and without erasures), and
+//! [`ccsds`] (spec-verified presets: AOS Frame Header Error Control and
+//! TM Synchronization and Channel Coding, including symbol interleaving
+//! and the dual-basis representation the latter requires). See
+//! `PORTING_PLAN.md` for the full history of what was verified against
+//! which standard, and how.
 #![no_std]
 
 extern crate alloc;

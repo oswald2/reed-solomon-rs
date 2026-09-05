@@ -54,6 +54,14 @@ pub enum RsError {
     /// The C implementation doesn't check this, and silently computes a
     /// nonsensical position via unsigned underflow instead of failing.
     InvalidErasureLocation,
+    /// The interleaving depth passed to
+    /// [`crate::ccsds::tm_channel_coding::encode_interleaved`]/
+    /// `decode_interleaved` is `0`, isn't one of CCSDS 131.0-B's allowed
+    /// values, or doesn't evenly divide the given message/codeword
+    /// length (required so each of the `depth` sub-codewords gets the
+    /// same length, matching the standard's "Q is a multiple of I"
+    /// virtual-fill constraint).
+    InvalidInterleavingDepth,
 }
 
 impl fmt::Display for RsError {
@@ -70,6 +78,9 @@ impl fmt::Display for RsError {
             RsError::TooManyErrors => "too many errors to recover from",
             RsError::TooManyErasures => "too many erasures for this code's min_distance",
             RsError::InvalidErasureLocation => "an erasure location is out of range for the encoded block",
+            RsError::InvalidInterleavingDepth => {
+                "interleaving depth is invalid, or doesn't evenly divide the given length"
+            }
         };
         f.write_str(msg)
     }

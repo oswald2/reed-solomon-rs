@@ -13,9 +13,9 @@ polynomial, first consecutive root, root gap, `num_roots` all runtime
 values). On top of that, add CCSDS conformance presets:
 
 - CCSDS 732.0-B AOS Frame Header Error Control: RS(10,6), GF(2^4), `0x13`.
-- CCSDS 131.0-B TM Synchronization and Channel Coding: RS(255,223), GF(2^8),
-  interleaving depths I in {1,2,3,4,5,8}, dual-basis <-> conventional-basis
-  symbol conversion (Annex G).
+- CCSDS 131.0-B TM Synchronization and Channel Coding: RS(255,223)/RS(255,239),
+  GF(2^8), interleaving depths I in {1,2,3,4,5,8}, dual-basis <->
+  conventional-basis symbol conversion (annex F).
 
 Out of scope: convolutional codes, SSE variants, the `fec_shim` compat
 layer, CCSDS TC (which uses BCH, not RS).
@@ -76,11 +76,32 @@ layer, CCSDS TC (which uses BCH, not RS).
       output against the standard's own published `g(x)` coefficients
       byte-for-byte -- see `ccsds::fhec`'s
       `generator_polynomial_matches_the_published_standard` test.
-   b. `ccsds::tm_channel_coding` (+ interleaving) and `ccsds::dual_basis`
-      -- not started. CCSDS 131.0-B's RS(255,223) root convention,
-      interleaving depths, and the dual-basis <-> conventional-basis
-      symbol conversion table all need the same fetch-and-verify
-      treatment phase 6a got, not assumption.
+   b. `ccsds::tm_channel_coding` + `ccsds::dual_basis` (done) -- CCSDS
+      131.0-B-5 section 4 and annexes F/G. Same fetch-and-verify
+      treatment as 6a: fetched the actual PDF, confirmed
+      `F(x) = x^8+x^7+x^2+x+1` (`0x187`, already
+      `correct_rs_primitive_polynomial_ccsds` in the C library) and that
+      the generator's roots are consecutive powers of `alpha^11`
+      (`generator_root_gap = 11`), spanning `alpha^(128-E)..alpha^(127+E)`
+      for the two selectable strengths `E=16` ((255,223),
+      `first_consecutive_root=112`) and `E=8` ((255,239),
+      `first_consecutive_root=120`). Verified against the standard's own
+      annex G, which publishes the *complete* generator polynomial
+      coefficients for both codes (33 and 17 terms respectively) --
+      `ccsds::tm_channel_coding`'s `e16_generator_polynomial_matches_*`
+      and `e8_generator_polynomial_matches_*` tests check
+      `ReedSolomon::generator()` against them byte-for-byte, transcribed
+      straight from the standard's binary columns (no hex-conversion-by-
+      hand step to introduce transcription error). The dual-basis
+      transform (`ccsds::dual_basis`) is annex F's two 8x8 GF(2)
+      matrices, verified against both of the annex's own worked
+      examples, in both directions. Symbol interleaving (SS4.4.1) is
+      generic round-robin demux/mux over repeated calls to the
+      underlying codec, needing no new field/polynomial math; validated
+      with a test that a burst of `depth` consecutive corrupted symbols
+      (which would exceed a single codeword's correction capacity) is
+      recovered once interleaved, since that's the entire point of the
+      feature.
 
 ## Correctness strategy
 
