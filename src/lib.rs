@@ -7,18 +7,19 @@
 //! generality is what makes it possible to implement the various
 //! Reed-Solomon codes CCSDS standardizes -- see the [`ccsds`] module.
 //!
-//! Ported so far: [`field`] (GF(2^k) construction and arithmetic).
-//! See `PORTING_PLAN.md` in the repo root for the rest of the roadmap.
+//! Ported so far: [`field`] (GF(2^k) construction and arithmetic) and
+//! [`polynomial`] (polynomial arithmetic over a field). See
+//! `PORTING_PLAN.md` in the repo root for the rest of the roadmap.
 #![no_std]
 
 extern crate alloc;
 
 pub mod field;
+pub mod polynomial;
 
-// Phase 2+: polynomial operations, the RS codec itself, and CCSDS presets.
-// Left undeclared until their contents exist, so an empty file doesn't
-// silently compile as a real (but vacuous) module.
-// pub mod polynomial;
+// Phase 3+: the RS codec itself and CCSDS presets. Left undeclared until
+// their contents exist, so an empty file doesn't silently compile as a
+// real (but vacuous) module.
 // pub mod error;
 // pub mod rs;
 // pub mod ccsds;

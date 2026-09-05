@@ -31,6 +31,15 @@ layer, CCSDS TC (which uses BCH, not RS).
 - Keep byte-order reversal and log-table aliasing quirks (e.g. `log(1)` as
   `0` vs `largest_element`) bit-for-bit identical to the C: the
   Forney/Chien-search math and CCSDS wire compatibility depend on them.
+- Polynomials are plain `&[u8]`/`&mut [u8]` coefficient slices (order is
+  just `len() - 1`), not a stateful `Polynomial` type. The C `polynomial_t`
+  pairs a buffer with a separately-mutable `order` so decode-time scratch
+  buffers can be reused across calls without reallocating even as their
+  logical length changes; here that's expressed with slicing
+  (`&buf[..=order]`) at the call site instead, which keeps `polynomial.rs`
+  itself simple and independently testable. The scratch-buffer reuse this
+  was for happens in the RS decoder (phase 4+), which owns the buffers and
+  slices into them.
 
 ## Phases
 

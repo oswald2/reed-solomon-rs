@@ -111,11 +111,7 @@ impl GaloisField {
     /// polynomial/RS code that needs to skip the bounds/zero checks
     /// `mul`/`div` do, the same way the C code indexes `field.exp[...]`
     /// directly in its hot paths.
-    //
-    // Not yet called outside tests -- the polynomial/RS modules that will
-    // use this (phase 2+) don't exist yet.
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn exp_table(&self) -> &[u8] {
         &self.exp
     }
@@ -123,7 +119,6 @@ impl GaloisField {
     /// Direct access to the logarithm table. `log[0]` is a sentinel and
     /// must not be treated as a real logarithm.
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn log_table(&self) -> &[u8] {
         &self.log
     }

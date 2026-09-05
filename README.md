@@ -22,7 +22,7 @@ Early port, in progress. See `PORTING_PLAN.md` for the phased plan and
 current progress.
 
 - [x] Phase 1: `field` — GF(2^k) construction and arithmetic
-- [ ] Phase 2: `polynomial` — polynomial operations over a field
+- [x] Phase 2: `polynomial` — polynomial operations over a field
 - [ ] Phase 3: RS construction + systematic encode
 - [ ] Phase 4: RS decode (Berlekamp-Massey, Chien search, Forney)
 - [ ] Phase 5: RS decode with erasures
