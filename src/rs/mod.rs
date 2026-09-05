@@ -1,11 +1,18 @@
-//! The Reed-Solomon codec itself: construction and systematic encode, port
-//! of `reed_solomon_build_generator`/`correct_reed_solomon_create` (from
+//! The Reed-Solomon codec itself: construction, systematic encode, and
+//! decode. Construction and encode port
+//! `reed_solomon_build_generator`/`correct_reed_solomon_create` (from
 //! `src/reed-solomon/reed-solomon.c`) and `correct_reed_solomon_encode`
-//! (from `src/reed-solomon/encode.c`).
+//! (from `src/reed-solomon/encode.c`); decode ports
+//! `correct_reed_solomon_decode` (from `src/reed-solomon/decode.c`),
+//! with its three main stages split into the [`berlekamp_massey`],
+//! [`chien`], and [`forney`] submodules.
 //!
-//! Decode (Berlekamp-Massey, Chien search, Forney, and the erasure path)
-//! is a later phase; this file will likely become a `rs/` directory with
-//! one submodule per decode stage once that lands, per `PORTING_PLAN.md`.
+//! Decoding with erasures (`correct_reed_solomon_decode_with_erasures`)
+//! is a later phase (see `PORTING_PLAN.md`).
+
+mod berlekamp_massey;
+mod chien;
+mod forney;
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -38,12 +45,7 @@ pub struct ReedSolomon {
     /// terminology), a.k.a. `num_roots`.
     min_distance: usize,
 
-    // Not read anywhere yet -- decode (phase 4+) needs both of these
-    // (generator_root_gap to map error roots back to locations, and
-    // first_consecutive_root in the Forney error-value calculation).
-    #[allow(dead_code)]
     first_consecutive_root: u8,
-    #[allow(dead_code)]
     generator_root_gap: u8,
     /// The `min_distance` roots of the generator polynomial:
     /// `alpha^(generator_root_gap * (i + first_consecutive_root))` for
@@ -56,6 +58,31 @@ pub struct ReedSolomon {
     // `encode` itself never allocates.
     encoded_polynomial: Vec<u8>, // len == block_length
     encoded_remainder: Vec<u8>,  // len == block_length; poly_mod's scratch/output
+
+    // Steady-state scratch buffers and precomputed tables for decode,
+    // likewise sized once here so `decode` never allocates. Comments
+    // give each buffer's length; `min_distance`/`block_length`/
+    // `field_size` refer to this codec's own values throughout.
+    received_polynomial: Vec<u8>, // len == block_length
+    syndromes: Vec<u8>,           // len == min_distance
+    error_locator: Vec<u8>,       // len == min_distance + 1
+    last_error_locator: Vec<u8>,  // len == min_distance + 1; berlekamp_massey scratch
+    error_locator_log: Vec<u8>,   // len == min_distance + 1
+    error_roots: Vec<u8>,         // len == min_distance
+    error_locations: Vec<u8>,     // len == min_distance
+    error_evaluator: Vec<u8>,     // len == min_distance; forney scratch
+    error_locator_derivative: Vec<u8>, // len == min_distance; forney scratch
+    error_vals: Vec<u8>,          // len == min_distance
+    /// `generator_root_exp[i]` holds the successive log-powers of
+    /// `generator_roots[i]`, `block_length` of them: used to evaluate
+    /// the received polynomial at each generator root (i.e. compute
+    /// syndromes) without recomputing those powers from scratch.
+    generator_root_exp: Vec<Vec<u8>>, // min_distance entries, each len == block_length
+    /// `element_exp[e]` holds the successive log-powers of field element
+    /// `e`, `min_distance` of them: used by Chien search and Forney's
+    /// algorithm, both of which need this for every field element, not
+    /// just the generator's roots.
+    element_exp: Vec<Vec<u8>>, // field_size entries, each len == min_distance
 }
 
 impl ReedSolomon {
@@ -93,9 +120,41 @@ impl ReedSolomon {
         }
         let generator = polynomial::from_roots(&field, &generator_roots);
 
+        // Precompute the successive log-powers of each generator root
+        // (for syndrome calculation) and of every field element (for
+        // Chien search and Forney's algorithm), so decode() itself never
+        // needs to build these on the fly.
+        let generator_root_exp: Vec<Vec<u8>> = generator_roots
+            .iter()
+            .map(|&root| {
+                let mut lut = vec![0u8; block_length];
+                polynomial::build_exp_lut(&field, root, &mut lut);
+                lut
+            })
+            .collect();
+        let element_exp: Vec<Vec<u8>> = (0..field.field_size())
+            .map(|e| {
+                let mut lut = vec![0u8; min_distance];
+                polynomial::build_exp_lut(&field, e as u8, &mut lut);
+                lut
+            })
+            .collect();
+
         Ok(ReedSolomon {
             encoded_polynomial: vec![0u8; block_length],
             encoded_remainder: vec![0u8; block_length],
+            received_polynomial: vec![0u8; block_length],
+            syndromes: vec![0u8; min_distance],
+            error_locator: vec![0u8; min_distance + 1],
+            last_error_locator: vec![0u8; min_distance + 1],
+            error_locator_log: vec![0u8; min_distance + 1],
+            error_roots: vec![0u8; min_distance],
+            error_locations: vec![0u8; min_distance],
+            error_evaluator: vec![0u8; min_distance],
+            error_locator_derivative: vec![0u8; min_distance],
+            error_vals: vec![0u8; min_distance],
+            generator_root_exp,
+            element_exp,
             field,
             block_length,
             message_length,
@@ -214,6 +273,157 @@ impl ReedSolomon {
 
         Ok(written)
     }
+
+    /// Finds and corrects errors in `encoded` (a full or shortened
+    /// codeword produced by [`ReedSolomon::encode`]), writing the
+    /// recovered message into `msg`.
+    ///
+    /// `encoded.len()` must be in `min_distance()..=block_length()`,
+    /// and `msg` must have room for the resulting message length,
+    /// `encoded.len() - min_distance()`.
+    ///
+    /// Can recover from as many as `min_distance() / 2` corrupted
+    /// symbols at unknown locations, and returns
+    /// `Err(RsError::TooManyErrors)` if there were more than that --
+    /// though, as in the C implementation, it's possible (if unlikely)
+    /// for a sufficiently corrupted block to be mistaken for a
+    /// different, valid codeword instead of being detected as
+    /// uncorrectable at all.
+    ///
+    /// Returns the number of bytes written to `msg`,
+    /// `encoded.len() - min_distance()`.
+    pub fn decode(&mut self, encoded: &[u8], msg: &mut [u8]) -> Result<usize, RsError> {
+        if encoded.len() > self.block_length {
+            return Err(RsError::EncodedTooLong);
+        }
+        if encoded.len() < self.min_distance {
+            return Err(RsError::EncodedTooShort);
+        }
+        let msg_length = encoded.len() - self.min_distance;
+        if msg.len() < msg_length {
+            return Err(RsError::BufferTooSmall);
+        }
+
+        // Undo encode()'s high-to-low reversal, and zero-fill the
+        // (unshortened) padding region above the message -- the mirror
+        // image of encode()'s own setup.
+        for (dst, &src) in self.received_polynomial[..encoded.len()]
+            .iter_mut()
+            .zip(encoded.iter().rev())
+        {
+            if src > self.field.largest_element() {
+                return Err(RsError::InvalidSymbol);
+            }
+            *dst = src;
+        }
+        for slot in self.received_polynomial[encoded.len()..self.block_length].iter_mut() {
+            *slot = 0;
+        }
+
+        let all_zero = find_syndromes(
+            &self.field,
+            &self.received_polynomial,
+            &self.generator_root_exp,
+            &mut self.syndromes,
+        );
+        if all_zero {
+            // All syndromes are 0, so the received block is already a
+            // valid codeword: no error occurred (or, vanishingly
+            // unlikely, one did but happened to land exactly on another
+            // valid codeword). Nothing to correct.
+            for (dst, &src) in msg[..msg_length]
+                .iter_mut()
+                .zip(self.received_polynomial[..encoded.len()].iter().rev())
+            {
+                *dst = src;
+            }
+            return Ok(msg_length);
+        }
+
+        let order = berlekamp_massey::find_error_locator(
+            &self.field,
+            &self.syndromes,
+            0,
+            &mut self.error_locator,
+            &mut self.last_error_locator,
+        );
+
+        // Log form of the locator, for the Chien search below (see
+        // polynomial::eval_log_lut's docs for why 0 safely doubles as
+        // "no term here" in this form).
+        for i in 0..=order {
+            self.error_locator_log[i] = self.field.log_table()[self.error_locator[i] as usize];
+        }
+
+        if !chien::factorize_error_locator(
+            &self.field,
+            0,
+            &self.error_locator_log[..=order],
+            &mut self.error_roots,
+            &self.element_exp,
+        ) {
+            // Berlekamp-Massey built a locator that's consistent with
+            // the syndromes but doesn't fully factor over this field:
+            // there were too many errors to recover from.
+            return Err(RsError::TooManyErrors);
+        }
+
+        chien::find_error_locations(
+            &self.field,
+            self.generator_root_gap,
+            &self.error_roots[..order],
+            &mut self.error_locations[..order],
+        );
+
+        forney::find_error_values(
+            &self.field,
+            &self.error_locator[..=order],
+            &self.syndromes,
+            &self.error_roots[..order],
+            self.first_consecutive_root,
+            &self.element_exp,
+            &mut self.error_evaluator,
+            &mut self.error_locator_derivative[..order],
+            &mut self.error_vals[..order],
+        );
+
+        for i in 0..order {
+            let location = self.error_locations[i] as usize;
+            self.received_polynomial[location] =
+                self.field.sub(self.received_polynomial[location], self.error_vals[i]);
+        }
+
+        for (dst, &src) in msg[..msg_length]
+            .iter_mut()
+            .zip(self.received_polynomial[..encoded.len()].iter().rev())
+        {
+            *dst = src;
+        }
+        Ok(msg_length)
+    }
+}
+
+/// Evaluates `received` at each of the generator's roots (i.e. computes
+/// the syndromes): because a valid codeword is, by construction, a
+/// multiple of the generator polynomial, it evaluates to 0 at every one
+/// of those roots, so any nonzero syndrome directly reveals the error
+/// polynomial's value there. Returns whether every syndrome was 0 (no
+/// detected error). Ported from `reed_solomon_find_syndromes`.
+fn find_syndromes(
+    field: &GaloisField,
+    received: &[u8],
+    generator_root_exp: &[Vec<u8>],
+    syndromes: &mut [u8],
+) -> bool {
+    let mut all_zero = true;
+    for (syndrome, root_exp) in syndromes.iter_mut().zip(generator_root_exp.iter()) {
+        let eval = polynomial::eval_lut(field, received, root_exp);
+        if eval != 0 {
+            all_zero = false;
+        }
+        *syndrome = eval;
+    }
+    all_zero
 }
 
 #[cfg(test)]
@@ -377,6 +587,127 @@ mod tests {
             let written = rs.encode(&msg, &mut encoded).unwrap();
             prop_assert_eq!(written, msg.len() + rs.min_distance());
             assert_is_valid_codeword(&rs, &encoded, msg.len());
+        }
+    }
+
+    #[test]
+    fn decode_with_no_errors_returns_the_original_message() {
+        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        let msg = [3u8, 7, 1, 15, 0, 9];
+        let mut encoded = [0u8; 10];
+        rs.encode(&msg, &mut encoded).unwrap();
+
+        let mut recovered = [0u8; 6];
+        let n = rs.decode(&encoded, &mut recovered).unwrap();
+        assert_eq!(n, msg.len());
+        assert_eq!(recovered, msg);
+    }
+
+    #[test]
+    fn ccsds_aos_fhec_round_trips_through_encode_and_decode() {
+        // The quiet/libcorrect#17 case itself: GF(16), min_distance 4,
+        // a message shortened to 6 symbols (RS(10,6)).
+        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        let msg = [3u8, 7, 1, 15, 0, 9];
+        let mut encoded = [0u8; 10];
+        rs.encode(&msg, &mut encoded).unwrap();
+
+        // Corrupt 2 symbols -- min_distance/2, this code's guaranteed
+        // correction capacity.
+        encoded[1] ^= 0x0a;
+        encoded[8] ^= 0x03;
+
+        let mut recovered = [0u8; 6];
+        let n = rs.decode(&encoded, &mut recovered).unwrap();
+        assert_eq!(n, msg.len());
+        assert_eq!(recovered, msg);
+    }
+
+    #[test]
+    fn decode_detects_corruption_beyond_correction_capacity() {
+        // min_distance = 4 guarantees correction of at most 2 errors;
+        // corrupt 5 of the 10 codeword bytes (well beyond capacity) and
+        // expect this to be detected rather than silently "corrected"
+        // into the wrong message.
+        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        let msg = [3u8, 7, 1, 15, 0, 9];
+        let mut encoded = [0u8; 10];
+        rs.encode(&msg, &mut encoded).unwrap();
+        for (i, byte) in encoded.iter_mut().enumerate().take(5) {
+            *byte = (*byte ^ (i as u8 + 1)) & 0x0f;
+        }
+        let mut recovered = [0u8; 6];
+        assert_eq!(
+            rs.decode(&encoded, &mut recovered),
+            Err(RsError::TooManyErrors)
+        );
+    }
+
+    /// Corrupts up to `max_errors` distinct positions in `encoded`,
+    /// picking positions from `raw_positions` (reduced mod
+    /// `encoded.len()`, deduplicated) and pairing each with the value at
+    /// the same index in `values`. Shared by the GF(16) and GF(256)
+    /// round-trip properties below.
+    fn corrupt(encoded: &mut [u8], max_errors: usize, raw_positions: &[u16], values: &[u8]) {
+        let mut positions: Vec<usize> = Vec::new();
+        for &p in raw_positions {
+            if positions.len() >= max_errors || positions.len() >= values.len() {
+                break;
+            }
+            let pos = (p as usize) % encoded.len();
+            if !positions.contains(&pos) {
+                positions.push(pos);
+            }
+        }
+        for (i, &pos) in positions.iter().enumerate() {
+            encoded[pos] ^= values[i];
+        }
+    }
+
+    proptest! {
+        /// Mirrors tests/rs_tester.c's test_rs_errors: encode a random
+        /// message, corrupt up to this code's guaranteed correction
+        /// capacity (min_distance / 2) at random positions, and check
+        /// decode recovers the exact original message.
+        #[test]
+        fn decode_recovers_from_errors_within_capacity_gf16(
+            min_distance in 2usize..14,
+            msg in proptest::collection::vec(0u8..=15u8, 0..13),
+            raw_positions in proptest::collection::vec(any::<u16>(), 0..8),
+            values in proptest::collection::vec(1u8..=15u8, 0..8),
+        ) {
+            let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, min_distance).unwrap();
+            prop_assume!(msg.len() <= rs.message_length());
+            let max_errors = rs.min_distance() / 2;
+            prop_assume!(max_errors > 0);
+
+            let mut encoded = vec![0u8; msg.len() + rs.min_distance()];
+            rs.encode(&msg, &mut encoded).unwrap();
+            corrupt(&mut encoded, max_errors, &raw_positions, &values);
+
+            let mut recovered = vec![0u8; msg.len()];
+            let n = rs.decode(&encoded, &mut recovered).unwrap();
+            prop_assert_eq!(n, msg.len());
+            prop_assert_eq!(recovered, msg);
+        }
+
+        #[test]
+        fn decode_recovers_from_errors_within_capacity_gf256(
+            msg in proptest::collection::vec(any::<u8>(), 0..223),
+            raw_positions in proptest::collection::vec(any::<u16>(), 0..16),
+            values in proptest::collection::vec(1u8..=255u8, 0..16),
+        ) {
+            let mut rs = ReedSolomon::new(POLY_GF256, 1, 1, 32).unwrap();
+            let max_errors = rs.min_distance() / 2;
+
+            let mut encoded = vec![0u8; msg.len() + rs.min_distance()];
+            rs.encode(&msg, &mut encoded).unwrap();
+            corrupt(&mut encoded, max_errors, &raw_positions, &values);
+
+            let mut recovered = vec![0u8; msg.len()];
+            let n = rs.decode(&encoded, &mut recovered).unwrap();
+            prop_assert_eq!(n, msg.len());
+            prop_assert_eq!(recovered, msg);
         }
     }
 }

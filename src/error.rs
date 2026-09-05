@@ -31,6 +31,21 @@ pub enum RsError {
     /// hold the result. The C implementation doesn't check this either,
     /// and will write out of bounds if the caller under-allocates.
     BufferTooSmall,
+    /// The block passed to `decode`/`decode_with_erasures` is longer
+    /// than this code's `block_length()`.
+    EncodedTooLong,
+    /// The block passed to `decode`/`decode_with_erasures` is shorter
+    /// than this code's `min_distance()`, so it can't even contain all
+    /// the parity symbols, let alone any message. The C implementation
+    /// doesn't check this, and computes the message length as an
+    /// unsigned underflow instead of failing.
+    EncodedTooShort,
+    /// Decoding failed: there were more errors (and, once erasure
+    /// decoding lands, erasures) than this code's `min_distance()` can
+    /// guarantee recovery from. As in the C implementation, it's
+    /// possible but unlikely for this to go undetected and instead
+    /// return an incorrectly "recovered" message.
+    TooManyErrors,
 }
 
 impl fmt::Display for RsError {
@@ -42,6 +57,9 @@ impl fmt::Display for RsError {
             RsError::MessageTooLong => "message is longer than this code's message length",
             RsError::InvalidSymbol => "a message byte is not a valid symbol for this code's field",
             RsError::BufferTooSmall => "output buffer is too small to hold the result",
+            RsError::EncodedTooLong => "encoded block is longer than this code's block length",
+            RsError::EncodedTooShort => "encoded block is shorter than this code's min_distance",
+            RsError::TooManyErrors => "too many errors to recover from",
         };
         f.write_str(msg)
     }
