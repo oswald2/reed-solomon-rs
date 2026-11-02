@@ -13,7 +13,7 @@
 mod berlekamp_massey;
 mod chien;
 mod forney;
-mod simd;
+pub(crate) mod simd;
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -733,8 +733,10 @@ impl ReedSolomon {
                 None => (depth, j),
             };
             let mut has_errors = false;
-            for (p, rem) in self.remainder.iter_mut().enumerate() {
-                *rem = parity[p * step + offset] ^ received_parity[p * depth + j];
+            let recomputed = parity[offset..].iter().step_by(step);
+            let received = received_parity[j..].iter().step_by(depth);
+            for ((rem, &p), &r) in self.remainder.iter_mut().zip(recomputed).zip(received) {
+                *rem = p ^ r;
                 has_errors |= *rem != 0;
             }
             if !has_errors {

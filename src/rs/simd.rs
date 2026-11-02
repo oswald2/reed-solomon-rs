@@ -17,8 +17,11 @@
 //!   AVX-512 needed) multiplies by `s` as an 8x8 bit matrix. `gf2p8mulb`
 //!   can't be used: it is hard-wired to the AES polynomial.
 //!
-//! `unsafe` is confined to this module: [`Kernel`] can only be built for
-//! a tier [`Tier::is_available`] confirms, which is what makes calling
+//! [`LinearMap`] applies a fixed GF(2)-linear byte map (the CCSDS
+//! dual-basis conversion) to whole slices with the same tiers.
+//!
+//! `unsafe` is confined to this module: [`Kernel`] and [`LinearMap`] only
+//! use a tier [`Tier::is_available`] confirms, which is what makes calling
 //! the `#[target_feature]` functions sound.
 
 use alloc::vec::Vec;
@@ -123,7 +126,7 @@ impl Kernel {
                     })
                     .collect();
             }
-            Tier::Gfni => kernel.affine = (0..=255u8).map(|s| affine_matrix(field, s)).collect(),
+            Tier::Gfni => kernel.affine = (0..=255u8).map(|s| affine_matrix(|x| field.mul(s, x))).collect(),
             Tier::Scalar => unreachable!(),
         }
         Some(kernel)
@@ -168,13 +171,88 @@ impl Kernel {
     }
 }
 
-/// Multiplication by `s` as the 8x8 bit matrix `gf2p8affineqb` takes:
-/// bit `i` of the product is the parity of `x & matrix.byte[7 - i]`, so
-/// byte `7 - i` has bit `j` set when `s * alpha^j` has bit `i` set.
-fn affine_matrix(field: &GaloisField, s: u8) -> u64 {
+/// A GF(2)-linear byte map applied to whole slices, see [`LinearMap::new`].
+#[derive(Debug, Clone)]
+pub(crate) struct LinearMap {
+    tier: Tier,
+    /// The map itself, for the scalar tier and the tail of a slice.
+    table: [u8; 256],
+    /// `f(v)` and `f(v << 4)` for `v` in `0..16`, for Ssse3/Avx2.
+    nibble: [u8; 32],
+    /// `f` as a `gf2p8affineqb` matrix, for Gfni.
+    affine: u64,
+}
+
+impl LinearMap {
+    /// Builds the map for `f`, which must be GF(2)-linear
+    /// (`f(a ^ b) == f(a) ^ f(b)`), using `tier` if it's available and
+    /// [`Tier::Scalar`] otherwise.
+    pub(crate) fn new(f: impl Fn(u8) -> u8, tier: Tier) -> LinearMap {
+        let table: [u8; 256] = core::array::from_fn(|x| f(x as u8));
+        let mut nibble = [0u8; 32];
+        for v in 0..16 {
+            nibble[v] = table[v];
+            nibble[16 + v] = table[v << 4];
+        }
+        LinearMap {
+            tier: if tier.is_available() { tier } else { Tier::Scalar },
+            table,
+            nibble,
+            affine: affine_matrix(|x| table[x as usize]),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tier(&self) -> Tier {
+        self.tier
+    }
+
+    /// `dst[i] = f(src[i])`. Panics if the lengths differ.
+    pub(crate) fn apply(&self, src: &[u8], dst: &mut [u8]) {
+        assert_eq!(src.len(), dst.len(), "source and destination lengths differ");
+        // SAFETY: both are valid for `src.len()` bytes, and distinct
+        // since `dst` is a unique borrow.
+        unsafe { self.apply_raw(src.as_ptr(), dst.as_mut_ptr(), src.len()) }
+    }
+
+    /// `buf[i] = f(buf[i])`.
+    pub(crate) fn apply_in_place(&self, buf: &mut [u8]) {
+        let p = buf.as_mut_ptr();
+        // SAFETY: `p` is valid for `buf.len()` bytes; every chunk is
+        // read completely before it's written.
+        unsafe { self.apply_raw(p, p, buf.len()) }
+    }
+
+    /// # Safety
+    /// `src` and `dst` must be valid for `len` bytes and either equal or
+    /// not overlapping.
+    unsafe fn apply_raw(&self, src: *const u8, dst: *mut u8, len: usize) {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        // SAFETY: `self.tier` was confirmed by `Tier::is_available` in
+        // `LinearMap::new`; the pointers are the caller's to guarantee.
+        unsafe {
+            match self.tier {
+                Tier::Ssse3 => return x86::map_ssse3(&self.nibble, &self.table, src, dst, len),
+                Tier::Avx2 => return x86::map_avx2(&self.nibble, &self.table, src, dst, len),
+                Tier::Gfni => return x86::map_gfni(self.affine, &self.table, src, dst, len),
+                Tier::Scalar => {}
+            }
+        }
+        for i in 0..len {
+            // SAFETY: `i < len`, the caller guarantees both are valid.
+            unsafe { *dst.add(i) = self.table[*src.add(i) as usize] };
+        }
+    }
+}
+
+/// The GF(2)-linear byte map `f` as the 8x8 bit matrix `gf2p8affineqb`
+/// takes: bit `i` of the result is the parity of `x & matrix.byte[7 - i]`,
+/// so byte `7 - i` has bit `j` set when `f(1 << j)` has bit `i` set.
+/// For multiplication by `s` in the field, `f(1 << j) = s * alpha^j`.
+fn affine_matrix(f: impl Fn(u8) -> u8) -> u64 {
     let mut matrix = 0u64;
     for j in 0..8 {
-        let column = field.mul(s, 1 << j);
+        let column = f(1 << j);
         for i in 0..8 {
             if column & (1 << i) != 0 {
                 matrix |= 1u64 << (8 * (7 - i) + j);
@@ -306,6 +384,72 @@ mod x86 {
         _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, acc);
         _mm256_movemask_epi8(_mm256_cmpeq_epi8(acc, _mm256_setzero_si256())) as u32
     }
+
+    /// Maps the bytes after the last whole chunk with the scalar table.
+    ///
+    /// # Safety
+    /// As for the `map_*` functions.
+    #[inline(always)]
+    unsafe fn map_tail(table: &[u8; 256], src: *const u8, dst: *mut u8, from: usize, len: usize) {
+        for i in from..len {
+            *dst.add(i) = table[*src.add(i) as usize];
+        }
+    }
+
+    /// # Safety
+    /// Needs SSSE3. `src` and `dst` must be valid for `len` bytes and
+    /// either equal or not overlapping.
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn map_ssse3(nibble: &[u8; 32], table: &[u8; 256], src: *const u8, dst: *mut u8, len: usize) {
+        let mask = _mm_set1_epi8(0x0f);
+        let lo = _mm_loadu_si128(nibble.as_ptr() as *const __m128i);
+        let hi = _mm_loadu_si128(nibble.as_ptr().add(16) as *const __m128i);
+        let mut i = 0;
+        while i + 16 <= len {
+            let v = _mm_loadu_si128(src.add(i) as *const __m128i);
+            let r = _mm_xor_si128(
+                _mm_shuffle_epi8(lo, _mm_and_si128(v, mask)),
+                _mm_shuffle_epi8(hi, _mm_and_si128(_mm_srli_epi16(v, 4), mask)),
+            );
+            _mm_storeu_si128(dst.add(i) as *mut __m128i, r);
+            i += 16;
+        }
+        map_tail(table, src, dst, i, len);
+    }
+
+    /// # Safety
+    /// Needs AVX2. Otherwise as [`map_ssse3`].
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn map_avx2(nibble: &[u8; 32], table: &[u8; 256], src: *const u8, dst: *mut u8, len: usize) {
+        let mask = _mm256_set1_epi8(0x0f);
+        let lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(nibble.as_ptr() as *const __m128i));
+        let hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(nibble.as_ptr().add(16) as *const __m128i));
+        let mut i = 0;
+        while i + 32 <= len {
+            let v = _mm256_loadu_si256(src.add(i) as *const __m256i);
+            let r = _mm256_xor_si256(
+                _mm256_shuffle_epi8(lo, _mm256_and_si256(v, mask)),
+                _mm256_shuffle_epi8(hi, _mm256_and_si256(_mm256_srli_epi16(v, 4), mask)),
+            );
+            _mm256_storeu_si256(dst.add(i) as *mut __m256i, r);
+            i += 32;
+        }
+        map_tail(table, src, dst, i, len);
+    }
+
+    /// # Safety
+    /// Needs AVX2 and GFNI. Otherwise as [`map_ssse3`].
+    #[target_feature(enable = "avx2,gfni")]
+    pub(super) unsafe fn map_gfni(affine: u64, table: &[u8; 256], src: *const u8, dst: *mut u8, len: usize) {
+        let m = _mm256_set1_epi64x(affine as i64);
+        let mut i = 0;
+        while i + 32 <= len {
+            let v = _mm256_loadu_si256(src.add(i) as *const __m256i);
+            _mm256_storeu_si256(dst.add(i) as *mut __m256i, _mm256_gf2p8affine_epi64_epi8::<0>(v, m));
+            i += 32;
+        }
+        map_tail(table, src, dst, i, len);
+    }
 }
 
 #[cfg(test)]
@@ -329,7 +473,7 @@ mod tests {
         let field = GaloisField::new(0x187);
         // Emulates gf2p8affineqb bit by bit.
         for s in 0..=255u8 {
-            let m = affine_matrix(&field, s);
+            let m = affine_matrix(|x| field.mul(s, x));
             for x in 0..=255u8 {
                 let mut y = 0u8;
                 for i in 0..8 {
@@ -337,6 +481,32 @@ mod tests {
                     y |= (((row & x).count_ones() & 1) as u8) << i;
                 }
                 assert_eq!(y, field.mul(s, x), "s={s} x={x}");
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn linear_maps_match_the_table_in_every_tier(
+            images in proptest::collection::vec(any::<u8>(), 8),
+            data in proptest::collection::vec(any::<u8>(), 0..200),
+            offset in 0usize..40,
+        ) {
+            // An arbitrary linear map, given by the images of the bits.
+            let f = |x: u8| (0..8).filter(|j| x & (1 << j) != 0).fold(0, |acc, j| acc ^ images[j]);
+            let offset = offset.min(data.len());
+            let expected: Vec<u8> = data[offset..].iter().map(|&x| f(x)).collect();
+            for tier in Tier::ALL {
+                let map = LinearMap::new(f, tier);
+                if map.tier() != tier {
+                    continue;
+                }
+                let mut out = vec![0x5au8; data.len() - offset];
+                map.apply(&data[offset..], &mut out);
+                prop_assert_eq!(&out, &expected, "{:?}", tier);
+                let mut in_place = data[offset..].to_vec();
+                map.apply_in_place(&mut in_place);
+                prop_assert_eq!(&in_place, &expected, "{:?} in place", tier);
             }
         }
     }

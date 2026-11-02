@@ -8,6 +8,7 @@
 //! the original C (libcorrect) implementation.
 
 use criterion::{criterion_group, criterion_main, Criterion};
+use reed_solomon_rs::ccsds::dual_basis::DualBasisConverter;
 use reed_solomon_rs::ccsds::{fhec, tm_channel_coding};
 use reed_solomon_rs::rs::ReedSolomon;
 
@@ -98,6 +99,17 @@ fn bench_tm_e16_i5(c: &mut Criterion) {
     group.finish();
 }
 
+/// Dual-basis conversion of a CADU-sized codeblock (1275 bytes).
+fn bench_dual_basis(c: &mut Criterion) {
+    let conv = DualBasisConverter::new();
+    let data: Vec<u8> = (0..1275).map(|i| (i * 7 + 3) as u8).collect();
+    let mut out = vec![0u8; 1275];
+    let mut group = c.benchmark_group("dual_basis_1275");
+    group.bench_function("from_dual", |b| b.iter(|| conv.from_dual(std::hint::black_box(&data), &mut out)));
+    group.bench_function("to_dual_in_place", |b| b.iter(|| conv.to_dual_in_place(std::hint::black_box(&mut out))));
+    group.finish();
+}
+
 fn bench_ccsds_aos_fhec(c: &mut Criterion) {
     let mut rs: ReedSolomon = fhec::codec();
     let msg = [3u8, 7, 1, 15, 0, 9];
@@ -125,5 +137,5 @@ fn bench_ccsds_aos_fhec(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_gf256_255_223, bench_tm_e16_i5, bench_ccsds_aos_fhec);
+criterion_group!(benches, bench_gf256_255_223, bench_tm_e16_i5, bench_dual_basis, bench_ccsds_aos_fhec);
 criterion_main!(benches);

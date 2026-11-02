@@ -97,12 +97,65 @@ The libcorrect column is the old space-rs `RSCADU::encode` (5x
 the `libcorrect.a` that space-rs shipped before it switched to this
 crate.
 
+## Decoder rewrite and SIMD (November 2026)
+
+See `SIMD_PLAN.md` for the design. In short:
+
+- Decoding computes the remainder of the received codeword with the
+  encoder and derives the syndromes from it. A codeword without errors is
+  detected after about one encode.
+- The Chien search only tries the positions of the (possibly shortened)
+  codeword and returns positions directly.
+- `decode_interleaved` checks all sub-codewords in one pass, without
+  copies.
+- A GF(256) multiply-accumulate kernel computes the remainder (and so
+  encodes), the syndromes and the Chien search. Its tier is picked at
+  runtime with the `std` feature: SSSE3, AVX2 or AVX2 + GFNI. Without
+  SIMD, the scalar code runs.
+- `DualBasisConverter` converts whole buffers with the same tiers.
+
+Output is bit-identical. Proptests check every SIMD tier against the
+scalar code, and space-rs checks the results against golden files
+generated with libcorrect.
+
+The numbers below are from a Xeon Silver 4309Y (Ice Lake-SP, which has all
+tiers), so compare only within this section. "Before" is the code before
+this rewrite on the same machine. The CADU rows are an E=16, I=5
+codeblock with a 1115 byte frame, including the dual basis (space-rs
+`RsCodeblockCoder`).
+
+| Case | Before | After (GFNI) | libcorrect |
+|---|---:|---:|---:|
+| gf256_255_223 / decode, no errors | 8.43 µs | 0.23 µs | |
+| gf256_255_223 / decode, 16 errors | 19.0 µs | 2.9 µs | |
+| gf256_255_223 / encode | 1.17 µs | 0.23 µs | |
+| CADU decode, no errors | 46.2 µs | 1.72 µs | 33.0 µs |
+| CADU decode, 16 errors per codeword | 93.5 µs | 13.7 µs | 79.0 µs |
+| CADU check symbols | 3.59 µs | 1.46 µs | 34.5 µs |
+
+Per tier, one E=16 codeword and an I=5 codeblock without the dual
+basis (`benches/decode_stages.rs`):
+
+| Case | Scalar | SSSE3 | AVX2 | GFNI |
+|---|---:|---:|---:|---:|
+| Decode, no errors | 1.00 µs | 0.45 µs | 0.32 µs | 0.23 µs |
+| Decode, 16 errors | 8.1 µs | 3.3 µs | 3.0 µs | 2.9 µs |
+| Encode | 0.98 µs | 0.46 µs | 0.32 µs | 0.23 µs |
+| I=5 decode, no errors | 3.41 µs | 2.74 µs | 2.14 µs | 1.56 µs |
+| I=5 decode, 16 errors per codeword | 39 µs | 17.1 µs | 15.9 µs | 14.9 µs |
+| I=5 encode | 3.19 µs | 2.62 µs | 2.02 µs | 1.43 µs |
+
+With 16 errors, about 2.4 µs of the 2.9 µs per codeword is
+Berlekamp-Massey and Forney, which are still scalar.
+
 ## Reproducing
 
 ```sh
 # Rust
 cd reed-solomon-rs
-cargo bench
+cargo bench --features std --bench rs_benchmarks
+# every SIMD tier this machine has, and the decode stages
+cargo bench --features std,bench-internals --bench decode_stages
 
 # C comparison harness (adjust the libcorrect path)
 mkdir -p /tmp/bench_c && cd /tmp/bench_c

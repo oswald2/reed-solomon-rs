@@ -7,12 +7,14 @@ that has it.
 
 ## Status (2 November 2026)
 
-Phases 0, 1 and 2 (x86) are implemented, measured on a Xeon Silver 4309Y
+Phases 0 to 3 (x86) are implemented, measured on a Xeon Silver 4309Y
 (Ice Lake-SP), see "Results" below. Not done yet:
 
-- Phase 3 (space-rs integration, `rev` bump, `BENCHMARKS.md`)
+- the `rev` bump in `space-rs/Cargo.toml`, which needs the reed-solomon-rs
+  commit
 - NEON for aarch64
 - measurements on real Zen 3 and Zen 4 hardware
+- SIMD or algorithmic work on Berlekamp-Massey and Forney
 
 ## Targets
 
@@ -213,7 +215,25 @@ is a 16- or 32-byte vector.
 `#[target_feature(enable = ...)]` function gets a SAFETY comment saying which
 detection guarantees it is only called when the feature is present.
 
-## Phase 3: space-rs integration
+## Phase 3: space-rs integration (done, except the `rev` bump)
+
+As built:
+
+- reed-solomon-rs has `ccsds::dual_basis::DualBasisConverter`. It converts
+  whole buffers with a `simd::LinearMap` (`gf2p8affineqb` with the T/T⁻¹
+  matrix, or `pshufb` nibble tables), in about 22 ns per direction for a
+  1275-byte codeblock.
+- space-rs `RsCodeblockCoder` uses it instead of the per-byte `LazyLock`
+  tables:
+  - decode: one conversion in, the codec, one in-place conversion out
+  - encode: the frame is converted into a stack buffer
+- Profiling showed the corrected-symbol count (`filter().count()`) costing
+  about 0.6 µs. On the SSE2 baseline it widened every comparison to 64
+  bits. It now counts in `u8` per 255-byte chunk.
+- Folding T/T⁻¹ into the codec's tables, so that no conversion is needed,
+  is possible. It isn't worth it at this conversion cost.
+
+Original plan:
 
 - `rs::RsCodeblockCoder::decode` (space-rs): avoid the `conventional` buffer
   copy where the new API allows it, for example by feeding dual-basis-mapped
@@ -267,16 +287,13 @@ With SIMD, the 16-error decode is now mostly Berlekamp-Massey and Forney.
 Both are scalar and could be the next target. Forney could evaluate Ω and
 Λ' at all error positions at once with the kernel.
 
-space-rs, GFNI picked at runtime:
+space-rs, GFNI picked at runtime (libcorrect harness):
 
-| Case | Before | Now | libcorrect |
-|---|---:|---:|---:|
-| `RsCodeblockCoder` check symbols | 3.60 µs | 2.47 µs | 34.9 µs |
-| `RsCodeblockCoder` decode, no errors | 46.4 µs | 4.0 µs | 33.1 µs |
-| `RsCodeblockCoder` decode, 16 errors/codeword | 93.9 µs | 16.9 µs | 79.0 µs |
-
-About 2.4 µs of the 4.0 µs no-error decode is space-rs's own dual-basis table
-mapping and output loop (Phase 3).
+| Case | Before | After Phase 2 | After Phase 3 | libcorrect |
+|---|---:|---:|---:|---:|
+| `RsCodeblockCoder` check symbols | 3.59 µs | 2.47 µs | 1.46 µs | 34.5 µs |
+| `RsCodeblockCoder` decode, no errors | 46.2 µs | 4.0 µs | 1.72 µs | 33.0 µs |
+| `RsCodeblockCoder` decode, 16 errors/codeword | 93.5 µs | 16.9 µs | 13.7 µs | 79.0 µs |
 
 ## Rough expectations (not measured, written before the work)
 
