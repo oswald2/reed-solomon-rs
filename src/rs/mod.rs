@@ -54,10 +54,11 @@ pub struct ReedSolomon {
     /// The generator polynomial itself, `product(x + generator_roots[i])`.
     generator: Vec<u8>,
 
-    // Steady-state scratch buffers for encode, sized once here so
-    // `encode` itself never allocates.
-    encoded_polynomial: Vec<u8>, // len == block_length
-    encoded_remainder: Vec<u8>,  // len == block_length; poly_mod's scratch/output
+    /// Multiplication table for the encoder's LFSR, `field_size` rows of
+    /// `min_distance` bytes: row `fb` holds `fb * generator[min_distance - 1 - j]`
+    /// for `j` in `0..min_distance`, i.e. the generator scaled by the
+    /// feedback symbol, highest order first (see [`ReedSolomon::encode_parity`]).
+    encode_table: Vec<u8>, // len == field_size * min_distance
 
     // Steady-state scratch buffers and precomputed tables for decode,
     // likewise sized once here so `decode` never allocates. Comments
@@ -140,6 +141,14 @@ impl ReedSolomon {
             *root = field.exp_table()[exponent];
         }
         let generator = polynomial::from_roots(&field, &generator_roots);
+        debug_assert_eq!(generator[min_distance], 1, "the generator polynomial is monic");
+
+        let mut encode_table = vec![0u8; field.field_size() as usize * min_distance];
+        for (fb, row) in encode_table.chunks_exact_mut(min_distance).enumerate() {
+            for (j, coeff) in row.iter_mut().enumerate() {
+                *coeff = field.mul(fb as u8, generator[min_distance - 1 - j]);
+            }
+        }
 
         // Precompute the successive log-powers of each generator root
         // (for syndrome calculation) and of every field element (for
@@ -162,8 +171,7 @@ impl ReedSolomon {
             .collect();
 
         Ok(ReedSolomon {
-            encoded_polynomial: vec![0u8; block_length],
-            encoded_remainder: vec![0u8; block_length],
+            encode_table,
             received_polynomial: vec![0u8; block_length],
             syndromes: vec![0u8; min_distance],
             error_locator: vec![0u8; min_distance + 1],
@@ -257,7 +265,7 @@ impl ReedSolomon {
     /// matter a great deal for a shortened code, i.e. exactly the CCSDS
     /// AOS FHEC case this crate exists for, so this port returns the
     /// value the docs actually promise.
-    pub fn encode(&mut self, msg: &[u8], encoded: &mut [u8]) -> Result<usize, RsError> {
+    pub fn encode(&self, msg: &[u8], encoded: &mut [u8]) -> Result<usize, RsError> {
         if msg.len() > self.message_length {
             return Err(RsError::MessageTooLong);
         }
@@ -266,46 +274,236 @@ impl ReedSolomon {
             return Err(RsError::BufferTooSmall);
         }
 
-        // The message goes from high order to low order (byte 0 is the
-        // most significant symbol), but polynomial coefficients go low
-        // to high, so we reverse on the way in and again on the way out.
-        // A shortened code just means pad_length virtual leading-zero
-        // symbols are never written into (or read out of) the buffer.
-        let pad_length = self.message_length - msg.len();
-        let block_len = self.block_length;
+        let (msg_out, parity) = encoded[..written].split_at_mut(msg.len());
+        self.encode_parity(msg.iter().copied(), parity)?;
+        msg_out.copy_from_slice(msg);
+        Ok(written)
+    }
 
-        // Equivalent to the C implementation's two memsets (one for the
-        // padding zone above the message, one for the parity zone below
-        // it): zero everything, then place the message in between.
-        self.encoded_polynomial.fill(0);
-        for (i, &b) in msg.iter().enumerate() {
-            if b > self.field.largest_element() {
+    /// Computes only the `min_distance()` parity symbols of the message
+    /// `msg` (highest order symbol first, as for [`ReedSolomon::encode`])
+    /// and writes them to `parity[..min_distance()]`, in the same order
+    /// `encode` appends them after the message.
+    ///
+    /// Taking the message as an iterator allows encoding symbols that are
+    /// not contiguous in memory without copying them first, e.g. one
+    /// sub-codeword of an interleaved codeblock
+    /// (`msg.iter().skip(j).step_by(depth).copied()`), possibly mapped
+    /// to another symbol representation on the fly. As with `encode`,
+    /// fewer than `message_length()` symbols encode a shortened code.
+    ///
+    /// Returns the number of message symbols consumed. Fails with
+    /// [`RsError::MessageTooLong`] if `msg` yields more than
+    /// `message_length()` symbols, [`RsError::InvalidSymbol`] for a
+    /// symbol outside the field and [`RsError::BufferTooSmall`] if
+    /// `parity` is shorter than `min_distance()`; `parity`'s contents are
+    /// unspecified after an error.
+    pub fn encode_parity(
+        &self,
+        msg: impl IntoIterator<Item = u8>,
+        parity: &mut [u8],
+    ) -> Result<usize, RsError> {
+        let parity = parity
+            .get_mut(..self.min_distance)
+            .ok_or(RsError::BufferTooSmall)?;
+        let msg = msg.into_iter();
+        let count = match self.min_distance {
+            // The register lengths of the CCSDS codes (TM channel coding
+            // E=16 and E=8, AOS FHEC), as fixed-size arrays the compiler
+            // can keep in vector registers.
+            32 => self.lfsr_fixed::<32>(msg, parity)?,
+            16 => self.lfsr_fixed::<16>(msg, parity)?,
+            4 => self.lfsr_fixed::<4>(msg, parity)?,
+            _ => self.lfsr(msg, parity)?,
+        };
+        if count > self.message_length {
+            return Err(RsError::MessageTooLong);
+        }
+        Ok(count)
+    }
+
+    /// Computes the parity symbols of `depth` interleaved codewords in a
+    /// single pass over `msg`: symbol `i` belongs to codeword `i % depth`,
+    /// and the parity is written interleaved the same way,
+    /// `parity[p * depth + j]` being parity symbol `p` of codeword `j`
+    /// (the symbol interleaving of CCSDS 131.0-B, see
+    /// [`crate::ccsds::tm_channel_coding::encode_interleaved`]).
+    ///
+    /// Encoding the codewords side by side is faster than one after the
+    /// other, since their (otherwise serially dependent) register updates
+    /// can overlap. Interleaving depths up to [`Self::MAX_FAST_DEPTH`] use
+    /// stack registers, larger depths allocate them.
+    ///
+    /// Returns the number of message symbols consumed, which must be a
+    /// multiple of `depth` ([`RsError::InvalidInterleavingDepth`]) and at
+    /// most `depth * message_length()` ([`RsError::MessageTooLong`]).
+    /// `parity` must hold at least `depth * min_distance()` symbols.
+    pub fn encode_parity_interleaved(
+        &self,
+        depth: usize,
+        msg: impl IntoIterator<Item = u8>,
+        parity: &mut [u8],
+    ) -> Result<usize, RsError> {
+        if depth == 0 {
+            return Err(RsError::InvalidInterleavingDepth);
+        }
+        let parity = parity
+            .get_mut(..depth * self.min_distance)
+            .ok_or(RsError::BufferTooSmall)?;
+        let msg = msg.into_iter();
+        let count = if depth <= Self::MAX_FAST_DEPTH {
+            match self.min_distance {
+                32 => self.lfsr_interleaved_fixed::<32>(depth, msg, parity)?,
+                16 => self.lfsr_interleaved_fixed::<16>(depth, msg, parity)?,
+                4 => self.lfsr_interleaved_fixed::<4>(depth, msg, parity)?,
+                _ => self.lfsr_interleaved(depth, msg, parity)?,
+            }
+        } else {
+            self.lfsr_interleaved(depth, msg, parity)?
+        };
+        if !count.is_multiple_of(depth) {
+            return Err(RsError::InvalidInterleavingDepth);
+        }
+        if count / depth > self.message_length {
+            return Err(RsError::MessageTooLong);
+        }
+        Ok(count)
+    }
+
+    /// The largest interleaving depth [`Self::encode_parity_interleaved`]
+    /// handles without allocating (the largest depth CCSDS 131.0-B allows).
+    pub const MAX_FAST_DEPTH: usize = 8;
+
+    #[inline(always)]
+    fn lfsr_interleaved_fixed<const N: usize>(
+        &self,
+        depth: usize,
+        msg: impl Iterator<Item = u8>,
+        parity: &mut [u8],
+    ) -> Result<usize, RsError> {
+        let largest = self.field.largest_element();
+        let mut regs = [[0u8; N]; Self::MAX_FAST_DEPTH];
+        let regs = &mut regs[..depth];
+        let mut k = 0;
+        let mut count = 0;
+        for m in msg {
+            if m > largest {
                 return Err(RsError::InvalidSymbol);
             }
-            self.encoded_polynomial[block_len - 1 - (i + pad_length)] = b;
+            let reg = &mut regs[k];
+            let fb = (m ^ reg[0]) as usize;
+            let row: &[u8; N] = self.encode_table[fb * N..(fb + 1) * N].try_into().unwrap();
+            let mut next = [0u8; N];
+            next[..N - 1].copy_from_slice(&reg[1..]);
+            for (r, g) in next.iter_mut().zip(row) {
+                *r ^= g;
+            }
+            *reg = next;
+            k += 1;
+            if k == depth {
+                k = 0;
+            }
+            count += 1;
         }
-
-        polynomial::poly_mod(
-            &self.field,
-            &self.encoded_polynomial,
-            &self.generator,
-            &mut self.encoded_remainder,
-        );
-
-        // Return byte order to highest order to lowest order: the
-        // message symbols live at polynomial indices
-        // [min_distance, min_distance + msg.len()), highest order first,
-        // so reverse that range on the way out.
-        let msg_region = &self.encoded_polynomial[self.min_distance..self.min_distance + msg.len()];
-        for (dst, &src) in encoded[..msg.len()].iter_mut().zip(msg_region.iter().rev()) {
-            *dst = src;
+        for (j, reg) in regs.iter().enumerate() {
+            for (p, &sym) in reg.iter().enumerate() {
+                parity[p * depth + j] = sym;
+            }
         }
-        let parity_region = self.encoded_remainder[..self.min_distance].iter().rev();
-        for (dst, src) in encoded[msg.len()..written].iter_mut().zip(parity_region) {
-            *dst = *src;
-        }
+        Ok(count)
+    }
 
-        Ok(written)
+    /// [`ReedSolomon::lfsr_interleaved_fixed`] for any `min_distance` and depth.
+    fn lfsr_interleaved(
+        &self,
+        depth: usize,
+        msg: impl Iterator<Item = u8>,
+        parity: &mut [u8],
+    ) -> Result<usize, RsError> {
+        let largest = self.field.largest_element();
+        let n = self.min_distance;
+        let mut regs = vec![0u8; depth * n];
+        let mut k = 0;
+        let mut count = 0;
+        for m in msg {
+            if m > largest {
+                return Err(RsError::InvalidSymbol);
+            }
+            let reg = &mut regs[k * n..(k + 1) * n];
+            let fb = (m ^ reg[0]) as usize;
+            reg.copy_within(1.., 0);
+            reg[n - 1] = 0;
+            for (r, g) in reg.iter_mut().zip(&self.encode_table[fb * n..(fb + 1) * n]) {
+                *r ^= g;
+            }
+            k += 1;
+            if k == depth {
+                k = 0;
+            }
+            count += 1;
+        }
+        for (j, reg) in regs.chunks_exact(n).enumerate() {
+            for (p, &sym) in reg.iter().enumerate() {
+                parity[p * depth + j] = sym;
+            }
+        }
+        Ok(count)
+    }
+
+    /// The systematic encoder as a linear feedback shift register, the
+    /// remainder of `msg(x) * x^min_distance` modulo the (monic)
+    /// generator. `reg[0]` holds the highest order remainder coefficient,
+    /// so per message symbol `m`, with `fb = m + reg[0]`:
+    /// `reg[j] = reg[j + 1] + fb * generator[min_distance - 1 - j]`.
+    /// A shortened code's virtual leading zeros leave the all-zero
+    /// register unchanged, so they need no special handling.
+    #[inline(always)]
+    fn lfsr_fixed<const N: usize>(
+        &self,
+        msg: impl Iterator<Item = u8>,
+        parity: &mut [u8],
+    ) -> Result<usize, RsError> {
+        let largest = self.field.largest_element();
+        let mut reg = [0u8; N];
+        let mut count = 0;
+        for m in msg {
+            if m > largest {
+                return Err(RsError::InvalidSymbol);
+            }
+            let fb = (m ^ reg[0]) as usize;
+            let row: &[u8; N] = self.encode_table[fb * N..(fb + 1) * N].try_into().unwrap();
+            let mut next = [0u8; N];
+            next[..N - 1].copy_from_slice(&reg[1..]);
+            for (r, g) in next.iter_mut().zip(row) {
+                *r ^= g;
+            }
+            reg = next;
+            count += 1;
+        }
+        parity.copy_from_slice(&reg);
+        Ok(count)
+    }
+
+    /// [`ReedSolomon::lfsr_fixed`] for any `min_distance`, using `parity`
+    /// itself as the register.
+    fn lfsr(&self, msg: impl Iterator<Item = u8>, parity: &mut [u8]) -> Result<usize, RsError> {
+        let largest = self.field.largest_element();
+        let n = self.min_distance;
+        parity.fill(0);
+        let mut count = 0;
+        for m in msg {
+            if m > largest {
+                return Err(RsError::InvalidSymbol);
+            }
+            let fb = (m ^ parity[0]) as usize;
+            parity.copy_within(1.., 0);
+            parity[n - 1] = 0;
+            for (r, g) in parity.iter_mut().zip(&self.encode_table[fb * n..(fb + 1) * n]) {
+                *r ^= g;
+            }
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Finds and corrects errors in `encoded` (a full or shortened
@@ -738,7 +936,7 @@ mod tests {
 
     #[test]
     fn encode_rejects_message_too_long() {
-        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 2).unwrap();
+        let rs = ReedSolomon::new(POLY_GF16, 1, 1, 2).unwrap();
         let msg = [0u8; 14]; // message_length() is 13
         let mut out = [0u8; 15];
         assert_eq!(rs.encode(&msg, &mut out), Err(RsError::MessageTooLong));
@@ -746,7 +944,7 @@ mod tests {
 
     #[test]
     fn encode_rejects_undersized_output_buffer() {
-        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 2).unwrap();
+        let rs = ReedSolomon::new(POLY_GF16, 1, 1, 2).unwrap();
         let msg = [1u8, 2, 3];
         let mut out = [0u8; 4]; // needs 3 + min_distance(2) == 5
         assert_eq!(rs.encode(&msg, &mut out), Err(RsError::BufferTooSmall));
@@ -754,7 +952,7 @@ mod tests {
 
     #[test]
     fn encode_rejects_out_of_range_symbol() {
-        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 2).unwrap();
+        let rs = ReedSolomon::new(POLY_GF16, 1, 1, 2).unwrap();
         let msg = [16u8]; // 16 is out of range for GF(16) (valid: 0..=15)
         let mut out = [0u8; 3];
         assert_eq!(rs.encode(&msg, &mut out), Err(RsError::InvalidSymbol));
@@ -769,7 +967,7 @@ mod tests {
         // convention doesn't matter for this particular check, so this
         // uses 1/1 rather than CCSDS's actual 6/1 -- see
         // src/ccsds/fhec.rs for the spec-exact preset).
-        let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        let rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
         assert_eq!(rs.message_length(), 11);
         let msg = [1u8, 2, 3, 4, 5, 6];
         let mut out = [0u8; 10];
@@ -785,7 +983,7 @@ mod tests {
         // See src/ccsds/fhec.rs for the spec-verified preset and its own
         // conformance test against the standard's published generator
         // polynomial.
-        let mut rs = ReedSolomon::new(POLY_GF16, 6, 1, 4).unwrap();
+        let rs = ReedSolomon::new(POLY_GF16, 6, 1, 4).unwrap();
         let msg = [3u8, 7, 1, 15, 0, 9];
         let mut encoded = [0u8; 10];
         let written = rs.encode(&msg, &mut encoded).unwrap();
@@ -799,7 +997,7 @@ mod tests {
             min_distance in 1usize..14,
             msg in proptest::collection::vec(0u8..=15u8, 0..13),
         ) {
-            let mut rs = ReedSolomon::new(POLY_GF16, 1, 1, min_distance).unwrap();
+            let rs = ReedSolomon::new(POLY_GF16, 1, 1, min_distance).unwrap();
             // Only exercise messages that fit this min_distance's message_length.
             prop_assume!(msg.len() <= rs.message_length());
 
@@ -813,12 +1011,108 @@ mod tests {
         fn encode_gf256_always_produces_a_valid_codeword(
             msg in proptest::collection::vec(any::<u8>(), 0..223),
         ) {
-            let mut rs = ReedSolomon::new(POLY_GF256, 1, 1, 32).unwrap();
+            let rs = ReedSolomon::new(POLY_GF256, 1, 1, 32).unwrap();
             let mut encoded = vec![0u8; msg.len() + rs.min_distance()];
             let written = rs.encode(&msg, &mut encoded).unwrap();
             prop_assert_eq!(written, msg.len() + rs.min_distance());
             assert_is_valid_codeword(&rs, &encoded, msg.len());
         }
+    }
+
+    /// The parity of `msg` the way the C implementation computes it:
+    /// `msg(x) * x^min_distance mod generator` via polynomial division.
+    fn reference_parity(rs: &ReedSolomon, msg: &[u8]) -> Vec<u8> {
+        let n = rs.block_length();
+        let pad = rs.message_length() - msg.len();
+        let mut dividend = vec![0u8; n];
+        for (i, &b) in msg.iter().enumerate() {
+            dividend[n - 1 - (i + pad)] = b;
+        }
+        let mut remainder = vec![0u8; n];
+        polynomial::poly_mod(rs.field(), &dividend, rs.generator(), &mut remainder);
+        remainder[..rs.min_distance()].iter().rev().copied().collect()
+    }
+
+    proptest! {
+        #[test]
+        fn lfsr_encoder_matches_polynomial_division(
+            gf256 in any::<bool>(),
+            min_distance_sel in 0usize..6,
+            fcr in 0u8..=255,
+            gap in 1u8..=15,
+            raw_msg in proptest::collection::vec(any::<u8>(), 0..250),
+        ) {
+            // the specialized register lengths (32, 16, 4) and the generic one
+            let (poly, min_distance) = if gf256 {
+                (POLY_GF256, [32, 16, 4, 1, 10, 33][min_distance_sel])
+            } else {
+                (POLY_GF16, [4, 1, 2, 6, 10, 14][min_distance_sel])
+            };
+            let rs = ReedSolomon::new(poly, fcr, gap, min_distance).unwrap();
+            let largest = rs.field().largest_element();
+            let msg: Vec<u8> = raw_msg
+                .iter()
+                .take(rs.message_length())
+                .map(|b| if gf256 { *b } else { b & largest })
+                .collect();
+
+            let mut parity = vec![0u8; min_distance];
+            prop_assert_eq!(rs.encode_parity(msg.iter().copied(), &mut parity), Ok(msg.len()));
+            prop_assert_eq!(&parity, &reference_parity(&rs, &msg));
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn interleaved_parity_matches_per_codeword_parity(
+            gf256 in any::<bool>(),
+            min_distance_sel in 0usize..4,
+            depth in 1usize..12,
+            raw_msg in proptest::collection::vec(any::<u8>(), 0..1200),
+        ) {
+            let (poly, min_distance) = if gf256 {
+                (POLY_GF256, [32, 16, 4, 10][min_distance_sel])
+            } else {
+                (POLY_GF16, [4, 2, 6, 10][min_distance_sel])
+            };
+            let rs = ReedSolomon::new(poly, 112, 11, min_distance).unwrap();
+            let largest = rs.field().largest_element();
+            let len = raw_msg.len().min(depth * rs.message_length()) / depth * depth;
+            let msg: Vec<u8> = raw_msg[..len].iter().map(|b| b & largest).collect();
+
+            let mut parity = vec![0u8; depth * min_distance];
+            prop_assert_eq!(rs.encode_parity_interleaved(depth, msg.iter().copied(), &mut parity), Ok(len));
+
+            let mut single = vec![0u8; min_distance];
+            for j in 0..depth {
+                rs.encode_parity(msg.iter().skip(j).step_by(depth).copied(), &mut single).unwrap();
+                for p in 0..min_distance {
+                    prop_assert_eq!(parity[p * depth + j], single[p]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encode_parity_interleaved_rejects_invalid_input() {
+        let rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        let mut parity = [0u8; 8];
+        assert_eq!(rs.encode_parity_interleaved(0, [0u8; 4], &mut parity), Err(RsError::InvalidInterleavingDepth));
+        assert_eq!(rs.encode_parity_interleaved(2, [0u8; 5], &mut parity), Err(RsError::InvalidInterleavingDepth));
+        assert_eq!(rs.encode_parity_interleaved(2, [0u8; 24], &mut parity), Err(RsError::MessageTooLong));
+        assert_eq!(rs.encode_parity_interleaved(2, [16u8; 2], &mut parity), Err(RsError::InvalidSymbol));
+        assert_eq!(rs.encode_parity_interleaved(2, [0u8; 2], &mut parity[..7]), Err(RsError::BufferTooSmall));
+        assert_eq!(rs.encode_parity_interleaved(2, [0u8; 22], &mut parity), Ok(22));
+    }
+
+    #[test]
+    fn encode_parity_rejects_invalid_input() {
+        let rs = ReedSolomon::new(POLY_GF16, 1, 1, 4).unwrap();
+        let mut parity = [0u8; 4];
+        assert_eq!(rs.encode_parity([0u8; 12], &mut parity), Err(RsError::MessageTooLong));
+        assert_eq!(rs.encode_parity([1u8, 16], &mut parity), Err(RsError::InvalidSymbol));
+        assert_eq!(rs.encode_parity([1u8], &mut parity[..3]), Err(RsError::BufferTooSmall));
+        assert_eq!(rs.encode_parity([0u8; 11], &mut parity), Ok(11));
     }
 
     #[test]

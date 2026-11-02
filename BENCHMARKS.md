@@ -60,18 +60,42 @@ profile, which inherits `release`'s `opt-level = 3`, vs. `gcc -O3`).
   GF(16) FHEC code (the actual motivating use case, and small enough
   that per-call overhead matters more than per-symbol work) it's
   essentially tied, even matching C on `decode_no_errors`.
-- The largest gap is GF(256) `encode` (1.48x). The likely cause is bounds
-  checking on slice indexing in the hot copy/reversal loops in
-  `ReedSolomon::encode` and `polynomial::poly_mod`, versus C's raw
-  pointer arithmetic; this is exactly the kind of gap that`get_unchecked`
-  in a few hot spots (with a safety comment justifying it, and only
-  after confirming it actually helps) could close, but that's a
-  targeted optimization pass, not something done as part of this
-  benchmark run.
+- The largest gap was GF(256) `encode` (1.48x). That was closed by the
+  encoder rewrite below, not by removing bounds checks: the gap came from
+  the algorithm (generic polynomial division), not from indexing.
 - The gap shrinks as the error/erasure count grows (1.48x at encode down
   to 1.17x with the most decode work), consistent with the difference
   being dominated by a roughly constant per-call/per-symbol overhead
   rather than an algorithmically worse decode path.
+
+## Encoder rewrite (November 2026)
+
+`ReedSolomon::encode` used to port libcorrect's encoder: it padded and
+reversed the message into a polynomial and ran a generic `poly_mod`, with
+two log/exp lookups per generator coefficient. It is now a systematic
+LFSR with a precomputed `field_size x min_distance` table
+(`row[fb][j] = fb * g[min_distance - 1 - j]`), and the common register
+lengths (32, 16, 4) are const generic so the shift and XOR stay in
+vector registers. `encode_parity_interleaved` encodes all `depth`
+sub-codewords of an interleaved codeblock in one pass. The independent
+register chains overlap, and no de-interleaving copies are needed.
+Output is bit-identical. A proptest checks it against `poly_mod`, and
+space-rs checks it against golden files generated with libcorrect.
+
+The numbers below come from a different, slower machine than the table
+above, so compare only within this table. Each pair was measured in the
+same run.
+
+| Case | Before | After | libcorrect |
+|---|---:|---:|---:|
+| gf256_255_223 / encode (one codeword) | 19.8 µs | 5.2 µs | |
+| ccsds_aos_fhec_10_6 / encode | 147 ns | 41 ns | |
+| CADU check symbols, E=16, I=5, 1115 byte frame, incl. dual basis (space-rs `RsCodeblockCoder::encode_parity`) | 102 µs | 8.4 µs | 75 µs |
+
+The libcorrect column is the old space-rs `RSCADU::encode` (5x
+`correct_reed_solomon_encode` plus dual-basis tables), linked against
+the `libcorrect.a` that space-rs shipped before it switched to this
+crate.
 
 ## Reproducing
 

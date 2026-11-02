@@ -75,13 +75,11 @@ pub fn codec_e8() -> ReedSolomon {
 /// parity symbols, themselves interleaved round-robin by parity
 /// position across sub-codewords, exactly as SS4.4.1 describes.
 ///
-/// Unlike the core [`ReedSolomon`] methods, this allocates two small,
-/// `depth`-independent scratch buffers per call: the `depth`-fold loop
-/// over full RS encodes this performs already dominates the cost, so
-/// avoiding two small `Vec`s here wouldn't meaningfully help, and doing
-/// so would need `depth` times as much caller-provided scratch instead.
+/// All sub-codewords are encoded in a single pass over `msg` with
+/// [`ReedSolomon::encode_parity_interleaved`], without de-interleaving
+/// copies or allocations.
 pub fn encode_interleaved(
-    rs: &mut ReedSolomon,
+    rs: &ReedSolomon,
     depth: usize,
     msg: &[u8],
     encoded: &mut [u8],
@@ -89,7 +87,6 @@ pub fn encode_interleaved(
     if !ALLOWED_INTERLEAVING_DEPTHS.contains(&depth) || !msg.len().is_multiple_of(depth) {
         return Err(RsError::InvalidInterleavingDepth);
     }
-    let per_codeword_msg_len = msg.len() / depth;
     let written = msg.len() + depth * rs.min_distance();
     if encoded.len() < written {
         return Err(RsError::BufferTooSmall);
@@ -97,21 +94,9 @@ pub fn encode_interleaved(
 
     // Message symbols pass straight through, unchanged, in their
     // original (already-interleaved) order.
-    encoded[..msg.len()].copy_from_slice(msg);
-
-    let mut codeword_msg = vec![0u8; per_codeword_msg_len];
-    let mut codeword_encoded = vec![0u8; per_codeword_msg_len + rs.min_distance()];
-    for j in 0..depth {
-        for (i, slot) in codeword_msg.iter_mut().enumerate() {
-            *slot = msg[i * depth + j];
-        }
-        rs.encode(&codeword_msg, &mut codeword_encoded)?;
-
-        let parity = &codeword_encoded[per_codeword_msg_len..];
-        for (p, &sym) in parity.iter().enumerate() {
-            encoded[msg.len() + p * depth + j] = sym;
-        }
-    }
+    let (msg_out, parity) = encoded[..written].split_at_mut(msg.len());
+    rs.encode_parity_interleaved(depth, msg.iter().copied(), parity)?;
+    msg_out.copy_from_slice(msg);
     Ok(written)
 }
 

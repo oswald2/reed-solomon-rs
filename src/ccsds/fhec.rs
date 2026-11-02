@@ -71,7 +71,7 @@ pub fn codec() -> ReedSolomon {
 /// into (or, for `msg`, extracting them from) actual header bits is the
 /// caller's responsibility. Fails with [`RsError::InvalidSymbol`] if any
 /// entry of `msg` is outside `0..=15`.
-pub fn encode(rs: &mut ReedSolomon, msg: &[u8; MESSAGE_LENGTH]) -> Result<[u8; NUM_ROOTS], RsError> {
+pub fn encode(rs: &ReedSolomon, msg: &[u8; MESSAGE_LENGTH]) -> Result<[u8; NUM_ROOTS], RsError> {
     let mut encoded = [0u8; CODEWORD_LENGTH];
     rs.encode(msg, &mut encoded)?;
     let mut parity = [0u8; NUM_ROOTS];
