@@ -14,7 +14,7 @@ Phases 0 to 3 (x86) are implemented, measured on a Xeon Silver 4309Y
   commit
 - NEON for aarch64
 - measurements on real Zen 3 and Zen 4 hardware
-- SIMD or algorithmic work on Berlekamp-Massey and Forney
+- SIMD for Berlekamp-Massey, see "Berlekamp-Massey and Forney" below
 
 ## Targets
 
@@ -259,6 +259,32 @@ Original plan:
 - Benchmark before and after each phase (criterion `--save-baseline` /
   `--baseline`), including the libcorrect harness.
 
+## Berlekamp-Massey and Forney (done)
+
+- **Forney, SIMD tiers:**
+  - Ω = Λ·S mod x^2t comes from the kernel. The coefficients are Λ
+    reversed, and the rows are a buffer of zeros followed by the
+    syndromes, with stride 1.
+  - Ω and the odd part of Λ are evaluated with `chien_matrix`, only on
+    the 32-position blocks that have errors (or erasures).
+  - In characteristic 2, `x·Λ'(x) = odd(x)`, so
+    `e = x^fcr · Ω(x) / odd(x)`.
+  - Stage time: 1.0 µs → 0.25–0.37 µs.
+- **Forney, scalar:** a log-domain variant measured no faster, and was
+  dropped. Only pre-SSSE3 CPUs run it.
+- **Berlekamp-Massey:**
+  - One scale factor `d / d_last` per update instead of a multiply and a
+    divide per coefficient (an exact identity).
+  - Syndrome logs are computed once.
+  - Stage time: 1.28 → 0.98 µs, on every tier.
+- **Berlekamp-Massey is now the largest stage left**, about 1 µs per
+  codeword with errors, however few. It is 32 dependent iterations, so
+  more would need SIMD within an iteration. That needs products of two
+  vectors, which only GFNI has (`gf2p8mulb`), and only for the AES
+  polynomial. GF(2^8) with 0x187 is isomorphic to it, so one
+  `gf2p8affineqb` could map the syndromes there and the locator back.
+  Only worth it if the many-errors case matters.
+
 ## Results (Xeon Silver 4309Y, Ice Lake-SP)
 
 One E=16 codeword and E16/I5 blocks (1115-byte message), from
@@ -268,10 +294,12 @@ One E=16 codeword and E16/I5 blocks (1115-byte message), from
 |---|---:|---:|---:|---:|---:|
 | Encode, 1 codeword | 1.17 µs | 0.98 µs | 0.46 µs | 0.32 µs | 0.23 µs |
 | Decode, no errors | 8.43 µs | 1.00 µs | 0.45 µs | 0.32 µs | 0.23 µs |
-| Decode, 16 errors | 19.0 µs | 8.1 µs | 3.3 µs | 3.0 µs | 2.9 µs |
+| Decode, 2 errors | | 3.18 µs | 0.96 µs | 0.77 µs | 0.65 µs |
+| Decode, 16 errors | 19.0 µs | 8.4 µs | 2.24 µs | 1.89 µs | 1.69 µs |
 | I5 encode | 3.23 µs | 3.19 µs | 2.62 µs | 2.02 µs | 1.43 µs |
 | I5 decode, no errors | 43.4 µs | 3.41 µs | 2.74 µs | 2.14 µs | 1.56 µs |
-| I5 decode, 16 errors/codeword | 101.6 µs | 39 µs | 17.1 µs | 15.9 µs | 14.9 µs |
+| I5 decode, 2 errors/codeword | | 14.9 µs | 5.28 µs | 4.58 µs | 3.81 µs |
+| I5 decode, 16 errors/codeword | 101.6 µs | 40.8 µs | 10.7 µs | 9.4 µs | 8.5 µs |
 
 Stages for 16 errors:
 
@@ -280,12 +308,8 @@ Stages for 16 errors:
 | Remainder | 0.98 µs | 450 ns | 314 ns | 218 ns |
 | Syndromes | 893 ns | 71 ns | 51 ns | 35 ns |
 | Chien | 3.9–4.5 µs | 324 ns | 224 ns | 187 ns |
-| Berlekamp-Massey | 1.28 µs | same | same | same |
-| Forney | 1.0–1.1 µs | same | same | same |
-
-With SIMD, the 16-error decode is now mostly Berlekamp-Massey and Forney.
-Both are scalar and could be the next target. Forney could evaluate Ω and
-Λ' at all error positions at once with the kernel.
+| Berlekamp-Massey | 0.98 µs (was 1.28) | same | same | same |
+| Forney | 1.0 µs | 368 ns | 286 ns | 246 ns |
 
 space-rs, GFNI picked at runtime (libcorrect harness):
 
@@ -293,7 +317,7 @@ space-rs, GFNI picked at runtime (libcorrect harness):
 |---|---:|---:|---:|---:|
 | `RsCodeblockCoder` check symbols | 3.59 µs | 2.47 µs | 1.46 µs | 34.5 µs |
 | `RsCodeblockCoder` decode, no errors | 46.2 µs | 4.0 µs | 1.72 µs | 33.0 µs |
-| `RsCodeblockCoder` decode, 16 errors/codeword | 93.5 µs | 16.9 µs | 13.7 µs | 79.0 µs |
+| `RsCodeblockCoder` decode, 16 errors/codeword | 93.5 µs | 16.9 µs | 13.7 µs (8.85 µs after BM/Forney) | 79.0 µs |
 
 ## Rough expectations (not measured, written before the work)
 

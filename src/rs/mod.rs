@@ -125,6 +125,10 @@ pub struct ReedSolomon {
     /// causes, so the locator at every position is the locator's
     /// coefficients times this matrix.
     chien_matrix: Vec<u8>, // len == (min_distance + 1) * CHIEN_WIDTH
+    /// Forney scratch: `row_width` zeros, then the syndromes, then zeros,
+    /// so that the error evaluator is the error locator (reversed) times
+    /// rows of this buffer with stride 1.
+    omega_rows: Vec<u8>, // len == 2 * row_width
     /// `element_exp[e]` holds the successive log-powers of field element
     /// `e`, `min_distance` of them: used by Chien search and Forney's
     /// algorithm, both of which need this for every field element, not
@@ -211,6 +215,7 @@ impl ReedSolomon {
             syndrome_matrix,
             parity_matrix,
             chien_matrix,
+            omega_rows: vec![0u8; 2 * row_width],
             encode_table,
             remainder: vec![0u8; min_distance],
             syndromes: vec![0u8; min_distance],
@@ -997,6 +1002,11 @@ impl ReedSolomon {
     /// `combined_locator` if `combined` (erasure decoding), otherwise from
     /// `error_locator`.
     fn forney(&mut self, count: usize, combined: bool) {
+        if let Some(kernel) = self.kernel.take() {
+            self.forney_with_kernel(&kernel, count, combined);
+            self.kernel = Some(kernel);
+            return;
+        }
         let locator = if combined {
             &self.combined_locator[..=count]
         } else {
@@ -1014,6 +1024,74 @@ impl ReedSolomon {
             &mut self.error_vals[..count],
         );
     }
+}
+
+impl ReedSolomon {
+    /// [`ReedSolomon::forney`] with the SIMD kernel. With `x` the root
+    /// at an error position, the error value is
+    /// `x^(first_consecutive_root - 1) * omega(x) / lambda'(x)`, and in
+    /// characteristic 2, `x * lambda'(x)` is the odd part of `lambda(x)`,
+    /// so it is `x^first_consecutive_root * omega(x) / odd(x)`. `omega`
+    /// and `odd` are evaluated with `chien_matrix`, on the blocks of
+    /// positions that have errors only.
+    fn forney_with_kernel(&mut self, kernel: &simd::Kernel, count: usize, combined: bool) {
+        let locator = if combined {
+            &self.combined_locator[..=count]
+        } else {
+            &self.error_locator[..=count]
+        };
+        let n = self.min_distance;
+        let w = self.row_width;
+
+        // omega[i] = sum_j locator[j] * syndromes[i - j] (i < n): with
+        // m = count - j, the coefficient locator[count - m] times
+        // omega_rows[w - count + i + m].
+        let mut reversed = [0u8; 256];
+        for (r, &c) in reversed.iter_mut().zip(locator.iter().rev()) {
+            *r = c;
+        }
+        let reversed = &reversed[..=count];
+        self.omega_rows[w..w + n].copy_from_slice(&self.syndromes);
+        let mut out = [0u8; simd::BLOCK];
+        for (b, chunk) in self.error_evaluator.chunks_mut(simd::BLOCK).enumerate() {
+            kernel.mul_acc(reversed, 1, &self.omega_rows[w - count + b * simd::BLOCK..], 1, &mut out);
+            chunk.copy_from_slice(&out[..chunk.len()]);
+        }
+
+        let mut odd = [0u8; 256];
+        for (t, (o, &c)) in odd.iter_mut().zip(locator).enumerate() {
+            if t % 2 == 1 {
+                *o = c;
+            }
+        }
+        let odd = &odd[..=count];
+
+        let mut blocks = 0u8; // bit b: block b has an error
+        for &p in &self.error_locations[..count] {
+            blocks |= 1 << (p as usize / simd::BLOCK);
+        }
+        let mut omega_at = [0u8; CHIEN_WIDTH];
+        let mut odd_at = [0u8; CHIEN_WIDTH];
+        while blocks != 0 {
+            let start = blocks.trailing_zeros() as usize * simd::BLOCK;
+            blocks &= blocks - 1;
+            let rows = &self.chien_matrix[start..];
+            kernel.mul_acc(&self.error_evaluator, 1, rows, CHIEN_WIDTH, block_mut(&mut omega_at, start));
+            kernel.mul_acc(odd, 1, rows, CHIEN_WIDTH, block_mut(&mut odd_at, start));
+        }
+
+        let fcr = self.first_consecutive_root as i32;
+        for (value, &p) in self.error_vals[..count].iter_mut().zip(&self.error_locations) {
+            let p = p as usize;
+            let x = self.chien_matrix[CHIEN_WIDTH + p];
+            *value = self.field.mul(self.field.pow(x, fcr), self.field.div(omega_at[p], odd_at[p]));
+        }
+    }
+}
+
+/// The block of `simd::BLOCK` symbols of `a` starting at `start`.
+fn block_mut(a: &mut [u8; CHIEN_WIDTH], start: usize) -> &mut [u8; simd::BLOCK] {
+    (&mut a[start..start + simd::BLOCK]).try_into().unwrap()
 }
 
 /// Row width of [`ReedSolomon::chien_matrix`]: every position of a

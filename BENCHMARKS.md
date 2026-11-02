@@ -113,6 +113,11 @@ See `SIMD_PLAN.md` for the design. In short:
   runtime with the `std` feature: SSSE3, AVX2 or AVX2 + GFNI. Without
   SIMD, the scalar code runs.
 - `DualBasisConverter` converts whole buffers with the same tiers.
+- Forney evaluates the error evaluator with the kernel, only on the
+  blocks of positions with errors. It takes `x·Λ'(x)` from the odd part
+  of Λ.
+- Berlekamp-Massey scales each update once per discrepancy instead of
+  doing a multiply and a divide per coefficient.
 
 Output is bit-identical. Proptests check every SIMD tier against the
 scalar code, and space-rs checks the results against golden files
@@ -127,10 +132,11 @@ codeblock with a 1115 byte frame, including the dual basis (space-rs
 | Case | Before | After (GFNI) | libcorrect |
 |---|---:|---:|---:|
 | gf256_255_223 / decode, no errors | 8.43 µs | 0.23 µs | |
-| gf256_255_223 / decode, 16 errors | 19.0 µs | 2.9 µs | |
+| gf256_255_223 / decode, 2 errors | | 0.65 µs | |
+| gf256_255_223 / decode, 16 errors | 19.0 µs | 1.69 µs | |
 | gf256_255_223 / encode | 1.17 µs | 0.23 µs | |
 | CADU decode, no errors | 46.2 µs | 1.72 µs | 33.0 µs |
-| CADU decode, 16 errors per codeword | 93.5 µs | 13.7 µs | 79.0 µs |
+| CADU decode, 16 errors per codeword | 93.5 µs | 8.85 µs | 79.1 µs |
 | CADU check symbols | 3.59 µs | 1.46 µs | 34.5 µs |
 
 Per tier, one E=16 codeword and an I=5 codeblock without the dual
@@ -139,14 +145,18 @@ basis (`benches/decode_stages.rs`):
 | Case | Scalar | SSSE3 | AVX2 | GFNI |
 |---|---:|---:|---:|---:|
 | Decode, no errors | 1.00 µs | 0.45 µs | 0.32 µs | 0.23 µs |
-| Decode, 16 errors | 8.1 µs | 3.3 µs | 3.0 µs | 2.9 µs |
+| Decode, 2 errors | 3.18 µs | 0.96 µs | 0.77 µs | 0.65 µs |
+| Decode, 16 errors | 8.4 µs | 2.24 µs | 1.89 µs | 1.69 µs |
 | Encode | 0.98 µs | 0.46 µs | 0.32 µs | 0.23 µs |
 | I=5 decode, no errors | 3.41 µs | 2.74 µs | 2.14 µs | 1.56 µs |
-| I=5 decode, 16 errors per codeword | 39 µs | 17.1 µs | 15.9 µs | 14.9 µs |
+| I=5 decode, 2 errors per codeword | 14.9 µs | 5.28 µs | 4.58 µs | 3.81 µs |
+| I=5 decode, 16 errors per codeword | 40.8 µs | 10.7 µs | 9.4 µs | 8.5 µs |
 | I=5 encode | 3.19 µs | 2.62 µs | 2.02 µs | 1.43 µs |
 
-With 16 errors, about 2.4 µs of the 2.9 µs per codeword is
-Berlekamp-Massey and Forney, which are still scalar.
+With SIMD, about 1 µs of a codeword's decode is Berlekamp-Massey
+(scalar, 32 dependent iterations), whatever the number of errors. With
+few errors, the remainder (about 0.2 µs with GFNI) is the rest of the
+floor.
 
 ## Reproducing
 

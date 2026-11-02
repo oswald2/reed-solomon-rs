@@ -28,6 +28,16 @@ pub(crate) fn find_error_locator(
     assert_eq!(error_locator.len(), min_distance + 1);
     assert_eq!(last_error_locator.len(), min_distance + 1);
 
+    let log = field.log_table();
+    let exp = field.exp_table();
+    // log(syndromes[i]), only meaningful where syndromes[i] != 0.
+    let mut syndrome_log = [0u8; 256];
+    for (l, &s) in syndrome_log.iter_mut().zip(syndromes) {
+        *l = log[s as usize];
+    }
+    // `a * scale` for a nonzero `scale` given as its log.
+    let mul_by = |a: u8, scale_log: usize| if a == 0 { 0 } else { exp[log[a as usize] as usize + scale_log] };
+
     let mut numerrors: usize = 0;
 
     // Initialize to f(x) = 1: no errors found yet.
@@ -48,7 +58,10 @@ pub(crate) fn find_error_locator(
         // from the actual next syndrome.
         let mut discrepancy = syndromes[i];
         for j in 1..=numerrors {
-            discrepancy = field.add(discrepancy, field.mul(error_locator[j], syndromes[i - j]));
+            let (c, s) = (error_locator[j], syndromes[i - j]);
+            if c != 0 && s != 0 {
+                discrepancy ^= exp[log[c as usize] as usize + syndrome_log[i - j] as usize];
+            }
         }
 
         if discrepancy == 0 {
@@ -61,6 +74,10 @@ pub(crate) fn find_error_locator(
             continue;
         }
 
+        // Every update adds the last locator scaled by
+        // discrepancy / last_discrepancy (both nonzero).
+        let scale_log = log[field.div(discrepancy, last_discrepancy) as usize] as usize;
+
         if 2 * numerrors <= i {
             // There's room to lengthen the LFSR by one tap to eliminate
             // this discrepancy. Shift the previous locator up by
@@ -72,8 +89,7 @@ pub(crate) fn find_error_locator(
             // delay_length >= 1) never clobbers a value at some smaller
             // index that's still waiting to be read.
             for j in (0..=last_order).rev() {
-                last_error_locator[j + delay_length] =
-                    field.div(field.mul(last_error_locator[j], discrepancy), last_discrepancy);
+                last_error_locator[j + delay_length] = mul_by(last_error_locator[j], scale_log);
             }
             for slot in last_error_locator[..delay_length].iter_mut() {
                 *slot = 0;
@@ -100,11 +116,8 @@ pub(crate) fn find_error_locator(
         // No more taps available: preserve last_locator as-is, but still
         // apply the correction to locator (this is the same update as
         // above, just without also swapping in a new last_locator).
-        for j in (0..=last_order).rev() {
-            error_locator[j + delay_length] = field.add(
-                error_locator[j + delay_length],
-                field.div(field.mul(last_error_locator[j], discrepancy), last_discrepancy),
-            );
+        for j in 0..=last_order {
+            error_locator[j + delay_length] ^= mul_by(last_error_locator[j], scale_log);
         }
         order = order.max(last_order + delay_length);
         delay_length += 1;

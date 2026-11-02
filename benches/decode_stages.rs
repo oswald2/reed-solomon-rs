@@ -18,6 +18,10 @@ fn bench_tiers(c: &mut Criterion) {
     for i in 0..16 {
         corrupted[i * 8] ^= 0xff;
     }
+    // A more typical load: a few errors.
+    let mut few_errors = encoded.clone();
+    few_errors[40] ^= 0x5a;
+    few_errors[170] ^= 0x01;
 
     const DEPTH: usize = 5;
     let block_msg: Vec<u8> = (0..1115).map(|i| (i * 7 + 3) as u8).collect();
@@ -25,6 +29,11 @@ fn bench_tiers(c: &mut Criterion) {
     tm_channel_coding::encode_interleaved(&rs, DEPTH, &block_msg, &mut block).unwrap();
     let mut corrupted_block = block.clone();
     corrupted_block[..80].iter_mut().for_each(|b| *b = !*b);
+    // 2 errors in each codeword.
+    let mut few_errors_block = block.clone();
+    for i in [3, 4, 5, 6, 7, 700, 701, 702, 703, 704] {
+        few_errors_block[i] ^= 0x33;
+    }
 
     for tier in Tier::ALL {
         if !set_tier(&mut rs, tier) {
@@ -36,6 +45,9 @@ fn bench_tiers(c: &mut Criterion) {
         group.bench_function("decode_no_errors", |b| {
             b.iter(|| rs.decode(black_box(&encoded), &mut out).unwrap())
         });
+        group.bench_function("decode_2_errors", |b| {
+            b.iter(|| rs.decode(black_box(&few_errors), &mut out).unwrap())
+        });
         group.bench_function("decode_16_errors", |b| {
             b.iter(|| rs.decode(black_box(&corrupted), &mut out).unwrap())
         });
@@ -46,6 +58,11 @@ fn bench_tiers(c: &mut Criterion) {
         group.bench_function("i5_decode_no_errors", |b| {
             b.iter(|| tm_channel_coding::decode_interleaved(&mut rs, DEPTH, black_box(&block), &mut out).unwrap())
         });
+        group.bench_function("i5_decode_2_errors", |b| {
+            b.iter(|| {
+                tm_channel_coding::decode_interleaved(&mut rs, DEPTH, black_box(&few_errors_block), &mut out).unwrap()
+            })
+        });
         group.bench_function("i5_decode_16_errors", |b| {
             b.iter(|| {
                 tm_channel_coding::decode_interleaved(&mut rs, DEPTH, black_box(&corrupted_block), &mut out).unwrap()
@@ -53,10 +70,13 @@ fn bench_tiers(c: &mut Criterion) {
         });
 
         // The stages, each leaving its state in place for the next one.
+        // Each stage is also run once outside its benchmark, which a
+        // filter may skip.
         let mut st = Stages::new(&mut rs);
         group.bench_function("stage_remainder", |b| b.iter(|| st.remainder(black_box(&encoded)).unwrap()));
         assert!(st.remainder(&corrupted).unwrap());
         group.bench_function("stage_syndromes", |b| b.iter(|| st.syndromes()));
+        st.syndromes();
         group.bench_function("stage_berlekamp_massey", |b| b.iter(|| black_box(st.berlekamp_massey())));
         let order = st.berlekamp_massey();
         assert_eq!(order, 16);
