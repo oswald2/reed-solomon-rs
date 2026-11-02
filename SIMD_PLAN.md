@@ -5,6 +5,29 @@ this crate, with SIMD where it pays off. It was written on a machine without
 AVX2. The measurements and the SIMD work are meant to be done on a machine
 that has it.
 
+## Status (2 November 2026)
+
+Phases 0, 1 and 2 (x86) are implemented, measured on a Xeon Silver 4309Y
+(Ice Lake-SP), see "Results" below. Not done yet:
+
+- Phase 3 (space-rs integration, `rev` bump, `BENCHMARKS.md`)
+- NEON for aarch64
+- measurements on real Zen 3 and Zen 4 hardware
+
+## Targets
+
+- **Floor: the rustc default `x86_64` target (SSE2), no `-C target-cpu`.**
+  The scalar code is the guaranteed path. Everything above it is picked at
+  runtime (with `std`) or from the enabled target features (without `std`).
+- **Old machines** (Nehalem/Westmere, SSE4.2): the SSSE3 tier. CPUs with SSE3
+  but no SSSE3 (AMD K10, Pentium 4) get scalar code.
+- **Zen 3** (x86-64-v3): the AVX2 tier.
+- **Zen 4**, also Zen 5, Ice Lake and newer, and Alder Lake and newer: the
+  GFNI tier. It uses the 256-bit VEX encoding, so it needs only AVX2 + GFNI
+  and no AVX-512.
+- **No AVX-512 tier.** 2t = 32 for E=16 fills exactly one ymm register, and
+  Zen 4 splits 512-bit operations into two 256-bit halves anyway.
+
 ## Where we are (November 2026)
 
 The encoder was already rewritten, see `BENCHMARKS.md`, "Encoder rewrite":
@@ -51,7 +74,20 @@ old machine are not comparable.
 - **The crate is `no_std` + `alloc`:** runtime CPU detection is only available
   with the `std` feature, which space-rs enables.
 
-## Phase 0: Measure each decode stage
+## Phase 0: Measure each decode stage (done)
+
+As built:
+
+- The `bench-internals` feature exposes `rs::bench_internals`: `Stages` and
+  `set_tier`.
+- `benches/decode_stages.rs` runs every available tier: full encode/decode,
+  E16/I5 blocks and each stage. Run it with
+  `cargo bench --features std,bench-internals --bench decode_stages`.
+- `benches/rs_benchmarks.rs` has a `tm_e16_i5` group.
+- Pass `--save-baseline` with `--bench <name>`, not with `--benches`: the lib
+  target's libtest harness rejects the option.
+
+Original plan:
 
 - Add a `bench-internals` feature with a `#[doc(hidden)]` module that exposes
   the decode stages to criterion:
@@ -67,7 +103,24 @@ old machine are not comparable.
   - `cargo bench -p space-rs --bench cadu`
   - the harness
 
-## Phase 1: Algorithmic fixes (portable, no `unsafe`, done first)
+## Phase 1: Algorithmic fixes (portable, no `unsafe`, done first) (done)
+
+As built, the decoder no longer needs the received polynomial:
+
+- The remainder gives the syndromes, and corrections are applied directly
+  to the output message.
+- The Chien search (`chien::find_error_positions`) walks the codeword's
+  positions with a log-domain recurrence. It returns roots and positions
+  together, which replaces the root-to-position table, and stops early.
+- `decode_interleaved` computes all remainders in one pass
+  (`encode_parity_interleaved`) and only decodes codewords with errors.
+- `decode` is now `decode_with_erasures` with no erasures.
+
+**Behavior change:** roots outside a shortened codeword now count as "too
+many errors". Before, they "corrected" virtual fill symbols and reported
+success.
+
+Original plan:
 
 1. **Syndromes from the remainder.**
    - Run the encoder LFSR (`encode_parity`) over the received message part and
@@ -95,7 +148,29 @@ old machine are not comparable.
 Benchmark after Phase 1 and look at the stage breakdown again. It decides how
 much of Phase 2 is still worth doing.
 
-## Phase 2: GF(256) SIMD kernel
+## Phase 2: GF(256) SIMD kernel (done for x86)
+
+As built, in `src/rs/simd.rs`:
+
+- One kernel, `Kernel::mul_acc`, computes `out[32] = Σ c_j · rows[j]` and
+  returns a zero-lane mask.
+- The coefficients can be read with a stride, so interleaved codewords are
+  used in place and need no de-interleave copy.
+- Tiers: SSSE3 and AVX2 use `pshufb` nibble tables; GFNI uses
+  `vgf2p8affineqb` with one 8x8 matrix per symbol.
+- `ReedSolomon` holds three matrices: syndrome, parity (`x^(u+2t) mod g`
+  rows) and Chien (`x_p^t`).
+- Any SIMD tier uses them for:
+  - the remainder
+  - the syndromes
+  - Chien
+  - **encode**: matrix form beats the LFSR on every tier, also for
+    interleaved blocks
+- The `force-scalar` feature turns the SIMD tiers off.
+- The proptest `every_simd_tier_matches_scalar` compares every available
+  tier with scalar, errors included.
+
+Original plan:
 
 **The kernel.** One multiply-accumulate kernel covers most uses:
 `acc ^= Σ s_i · V_i`, where each `s_i` is a single field symbol and each `V_i`
@@ -143,6 +218,9 @@ detection guarantees it is only called when the feature is present.
 - `rs::RsCodeblockCoder::decode` (space-rs): avoid the `conventional` buffer
   copy where the new API allows it, for example by feeding dual-basis-mapped
   symbols through an iterator as the encode side already does.
+- Dual-basis conversion is GF(2)-linear. It can be one `gf2p8affineqb` per
+  32 bytes (or two `pshufb` nibble lookups), or folded into the kernel's
+  per-symbol matrices.
 - Commit reed-solomon-rs and bump the `rev` pin in `space-rs/Cargo.toml`.
 - Add the results to `BENCHMARKS.md`.
 
@@ -161,7 +239,46 @@ detection guarantees it is only called when the feature is present.
 - Benchmark before and after each phase (criterion `--save-baseline` /
   `--baseline`), including the libcorrect harness.
 
-## Rough expectations (not measured)
+## Results (Xeon Silver 4309Y, Ice Lake-SP)
+
+One E=16 codeword and E16/I5 blocks (1115-byte message), from
+`decode_stages`:
+
+| Case | Before | Scalar | SSSE3 | AVX2 | GFNI |
+|---|---:|---:|---:|---:|---:|
+| Encode, 1 codeword | 1.17 µs | 0.98 µs | 0.46 µs | 0.32 µs | 0.23 µs |
+| Decode, no errors | 8.43 µs | 1.00 µs | 0.45 µs | 0.32 µs | 0.23 µs |
+| Decode, 16 errors | 19.0 µs | 8.1 µs | 3.3 µs | 3.0 µs | 2.9 µs |
+| I5 encode | 3.23 µs | 3.19 µs | 2.62 µs | 2.02 µs | 1.43 µs |
+| I5 decode, no errors | 43.4 µs | 3.41 µs | 2.74 µs | 2.14 µs | 1.56 µs |
+| I5 decode, 16 errors/codeword | 101.6 µs | 39 µs | 17.1 µs | 15.9 µs | 14.9 µs |
+
+Stages for 16 errors:
+
+| Stage | Scalar | SSSE3 | AVX2 | GFNI |
+|---|---:|---:|---:|---:|
+| Remainder | 0.98 µs | 450 ns | 314 ns | 218 ns |
+| Syndromes | 893 ns | 71 ns | 51 ns | 35 ns |
+| Chien | 3.9–4.5 µs | 324 ns | 224 ns | 187 ns |
+| Berlekamp-Massey | 1.28 µs | same | same | same |
+| Forney | 1.0–1.1 µs | same | same | same |
+
+With SIMD, the 16-error decode is now mostly Berlekamp-Massey and Forney.
+Both are scalar and could be the next target. Forney could evaluate Ω and
+Λ' at all error positions at once with the kernel.
+
+space-rs, GFNI picked at runtime:
+
+| Case | Before | Now | libcorrect |
+|---|---:|---:|---:|
+| `RsCodeblockCoder` check symbols | 3.60 µs | 2.47 µs | 34.9 µs |
+| `RsCodeblockCoder` decode, no errors | 46.4 µs | 4.0 µs | 33.1 µs |
+| `RsCodeblockCoder` decode, 16 errors/codeword | 93.9 µs | 16.9 µs | 79.0 µs |
+
+About 2.4 µs of the 4.0 µs no-error decode is space-rs's own dual-basis table
+mapping and output loop (Phase 3).
+
+## Rough expectations (not measured, written before the work)
 
 | Case | Old machine now | After the plan |
 |---|---:|---:|
@@ -198,19 +315,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-space-rs = { path = "/home/oswald/Projects/space-libraries-rs/space-rs" }
-reed-solomon-rs = { path = "/home/oswald/Projects/space-libraries-rs/reed-solomon-rs", features = ["std"] }
+space-rs = { path = "<workspace>/space-rs" }
+reed-solomon-rs = { path = "<workspace>/reed-solomon-rs", features = ["std"] }
 bytes = "1"
 
 [dev-dependencies]
 criterion = "0.8"
 
 [patch."ssh://git@git.terma.com/library/reed-solomon-rs.git"]
-reed-solomon-rs = { path = "/home/oswald/Projects/space-libraries-rs/reed-solomon-rs" }
+reed-solomon-rs = { path = "<workspace>/reed-solomon-rs" }
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# keeps it out of any enclosing workspace
+[workspace]
 
 [[bench]]
 name = "vs"

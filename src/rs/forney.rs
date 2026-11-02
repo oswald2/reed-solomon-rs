@@ -117,18 +117,21 @@ mod tests {
         let order = find_error_locator(&gf, &syndromes, 0, &mut error_locator, &mut last_error_locator);
         assert_eq!(order, injected.len());
 
-        let locator_log: Vec<u8> = error_locator[..=order]
-            .iter()
-            .map(|&c| gf.log_table()[c as usize])
-            .collect();
         let element_exp = build_element_exp(&gf, min_distance.max(order + 1));
 
+        let mut terms = vec![[0u8; 2]; order + 1];
         let mut error_roots = vec![0u8; order];
-        let ok = super::super::chien::factorize_error_locator(&gf, 0, &locator_log, &mut error_roots, &element_exp);
-        assert!(ok);
-
         let mut error_locations = vec![0u8; order];
-        super::super::chien::find_error_locations(&gf, generator_root_gap, &error_roots, &mut error_locations);
+        let ok = super::super::chien::find_error_positions(
+            &gf,
+            generator_root_gap,
+            gf.largest_element() as usize,
+            &error_locator[..=order],
+            &mut terms,
+            &mut error_roots,
+            &mut error_locations,
+        );
+        assert!(ok);
 
         let mut error_evaluator = vec![0u8; min_distance];
         let mut error_locator_derivative = vec![0u8; order];

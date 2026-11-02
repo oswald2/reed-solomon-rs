@@ -25,9 +25,6 @@
 //! standard requires for transmission (SS4.3.9) -- see [`super::dual_basis`],
 //! applied separately at the point of actual transmission/reception.
 
-use alloc::vec;
-use alloc::vec::Vec;
-
 use crate::error::RsError;
 use crate::rs::ReedSolomon;
 
@@ -112,6 +109,11 @@ pub fn encode_interleaved(
 ///
 /// `depth` must be one of [`ALLOWED_INTERLEAVING_DEPTHS`], and
 /// `encoded.len()` must be a multiple of `depth`.
+///
+/// All sub-codewords are checked in a single pass over `encoded` (with
+/// [`ReedSolomon::encode_parity_interleaved`]), and only those with
+/// errors are decoded further, without de-interleaving copies or
+/// allocations.
 pub fn decode_interleaved(
     rs: &mut ReedSolomon,
     depth: usize,
@@ -131,28 +133,14 @@ pub fn decode_interleaved(
         return Err(RsError::BufferTooSmall);
     }
 
-    let mut codeword: Vec<u8> = vec![0u8; per_codeword_len];
-    let mut codeword_msg = vec![0u8; per_codeword_msg_len];
-    for j in 0..depth {
-        for (i, slot) in codeword[..per_codeword_msg_len].iter_mut().enumerate() {
-            *slot = encoded[i * depth + j];
-        }
-        for p in 0..rs.min_distance() {
-            codeword[per_codeword_msg_len + p] = encoded[msg_len + p * depth + j];
-        }
-
-        rs.decode(&codeword, &mut codeword_msg)?;
-
-        for (i, &sym) in codeword_msg.iter().enumerate() {
-            msg[i * depth + j] = sym;
-        }
-    }
-    Ok(msg_len)
+    rs.decode_interleaved(depth, encoded, msg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     /// CCSDS 131.0-B-5 annex G's full published generator polynomial
     /// coefficients for E=16, `G0..G32`, transcribed directly from the

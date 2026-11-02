@@ -13,6 +13,7 @@
 mod berlekamp_massey;
 mod chien;
 mod forney;
+mod simd;
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -64,13 +65,16 @@ pub struct ReedSolomon {
     // likewise sized once here so `decode` never allocates. Comments
     // give each buffer's length; `min_distance`/`block_length`/
     // `field_size` refer to this codec's own values throughout.
-    received_polynomial: Vec<u8>, // len == block_length
+    /// The received codeword modulo the generator, in the encoder's
+    /// register order (highest order coefficient first).
+    remainder: Vec<u8>,           // len == min_distance
     syndromes: Vec<u8>,           // len == min_distance
     error_locator: Vec<u8>,       // len == min_distance + 1
     last_error_locator: Vec<u8>,  // len == min_distance + 1; berlekamp_massey scratch
-    error_locator_log: Vec<u8>,   // len == min_distance + 1
+    /// Chien search scratch: `(log, step)` per nonzero locator term.
+    chien_terms: Vec<[u8; 2]>,    // len == min_distance + 1
     error_roots: Vec<u8>,         // len == min_distance
-    error_locations: Vec<u8>,     // len == min_distance
+    error_locations: Vec<u8>,     // len == min_distance; codeword positions
     error_evaluator: Vec<u8>,     // len == min_distance; forney scratch
     error_locator_derivative: Vec<u8>, // len == min_distance; forney scratch
     error_vals: Vec<u8>,          // len == min_distance
@@ -94,12 +98,33 @@ pub struct ReedSolomon {
     /// build `erasure_locator` from the caller-supplied erasure
     /// locations without allocating.
     init_from_roots_scratch: [Vec<u8>; 2], // each len == min_distance + 1
+    /// The recomputed parity of all codewords in `decode_interleaved`.
+    interleaved_parity: Vec<u8>, // len == MAX_FAST_DEPTH * min_distance
 
-    /// `generator_root_exp[i]` holds the successive log-powers of
-    /// `generator_roots[i]`, `block_length` of them: used to evaluate
-    /// the received polynomial at each generator root (i.e. compute
-    /// syndromes) without recomputing those powers from scratch.
-    generator_root_exp: Vec<Vec<u8>>, // min_distance entries, each len == block_length
+    /// `syndrome_exp[i][j]` is `log(generator_roots[i]^(min_distance - 1 - j))`:
+    /// the power of the generator root that remainder coefficient `j`
+    /// is multiplied with to compute syndrome `i`.
+    syndrome_exp: Vec<Vec<u8>>, // min_distance entries, each len == min_distance
+
+    // The SIMD kernel, if the CPU has one (see `simd`), and the matrices
+    // it multiplies with. The matrices exist for every GF(256) code;
+    // their rows are `row_width` (`min_distance` rounded up to whole
+    // `simd::BLOCK`s) or `CHIEN_WIDTH` symbols, padded with zeros.
+    kernel: Option<simd::Kernel>,
+    row_width: usize,
+    /// Row `j`, column `i`: `generator_roots[i]^(min_distance - 1 - j)`,
+    /// so the syndromes are `remainder` times this matrix.
+    syndrome_matrix: Vec<u8>, // len == min_distance * row_width
+    /// Row `r`: `x^(message_length - 1 - r + min_distance) mod generator`
+    /// in register order, i.e. the parity of a message with a single
+    /// `1` at symbol `r` of a full-length message. A message's parity is
+    /// the message times this matrix (the last rows for a shortened one).
+    parity_matrix: Vec<u8>, // len == message_length * row_width
+    /// Row `t`, column `p`: `x_p^t`, where `x_p = alpha^(-generator_root_gap * p)`
+    /// is the error locator root an error at codeword position `p`
+    /// causes, so the locator at every position is the locator's
+    /// coefficients times this matrix.
+    chien_matrix: Vec<u8>, // len == (min_distance + 1) * CHIEN_WIDTH
     /// `element_exp[e]` holds the successive log-powers of field element
     /// `e`, `min_distance` of them: used by Chien search and Forney's
     /// algorithm, both of which need this for every field element, not
@@ -152,13 +177,14 @@ impl ReedSolomon {
 
         // Precompute the successive log-powers of each generator root
         // (for syndrome calculation) and of every field element (for
-        // Chien search and Forney's algorithm), so decode() itself never
-        // needs to build these on the fly.
-        let generator_root_exp: Vec<Vec<u8>> = generator_roots
+        // Forney's algorithm), so decode() itself never needs to build
+        // these on the fly.
+        let syndrome_exp: Vec<Vec<u8>> = generator_roots
             .iter()
             .map(|&root| {
-                let mut lut = vec![0u8; block_length];
+                let mut lut = vec![0u8; min_distance];
                 polynomial::build_exp_lut(&field, root, &mut lut);
+                lut.reverse();
                 lut
             })
             .collect();
@@ -170,13 +196,27 @@ impl ReedSolomon {
             })
             .collect();
 
+        let tier = simd::Tier::detect();
+        let kernel = simd::Kernel::new(&field, tier);
+        let row_width = min_distance.div_ceil(simd::BLOCK) * simd::BLOCK;
+        let (syndrome_matrix, parity_matrix, chien_matrix) = if field.field_size() == 256 {
+            build_simd_matrices(&field, &generator_roots, &encode_table, generator_root_gap, row_width)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+
         Ok(ReedSolomon {
+            kernel,
+            row_width,
+            syndrome_matrix,
+            parity_matrix,
+            chien_matrix,
             encode_table,
-            received_polynomial: vec![0u8; block_length],
+            remainder: vec![0u8; min_distance],
             syndromes: vec![0u8; min_distance],
             error_locator: vec![0u8; min_distance + 1],
             last_error_locator: vec![0u8; min_distance + 1],
-            error_locator_log: vec![0u8; min_distance + 1],
+            chien_terms: vec![[0u8; 2]; min_distance + 1],
             error_roots: vec![0u8; min_distance],
             error_locations: vec![0u8; min_distance],
             error_evaluator: vec![0u8; min_distance],
@@ -187,7 +227,8 @@ impl ReedSolomon {
             modified_syndromes: vec![0u8; min_distance],
             syndrome_snapshot: vec![0u8; min_distance],
             init_from_roots_scratch: [vec![0u8; min_distance + 1], vec![0u8; min_distance + 1]],
-            generator_root_exp,
+            interleaved_parity: vec![0u8; Self::MAX_FAST_DEPTH * min_distance],
+            syndrome_exp,
             element_exp,
             field,
             block_length,
@@ -307,6 +348,19 @@ impl ReedSolomon {
             .get_mut(..self.min_distance)
             .ok_or(RsError::BufferTooSmall)?;
         let msg = msg.into_iter();
+        if let Some(kernel) = &self.kernel {
+            let mut buf = [0u8; 256];
+            let mut count = 0;
+            for m in msg {
+                if count == self.message_length {
+                    return Err(RsError::MessageTooLong);
+                }
+                buf[count] = m;
+                count += 1;
+            }
+            self.parity_with_kernel(kernel, &buf[..count], 1, parity);
+            return Ok(count);
+        }
         let count = match self.min_distance {
             // The register lengths of the CCSDS codes (TM channel coding
             // E=16 and E=8, AOS FHEC), as fixed-size arrays the compiler
@@ -351,6 +405,9 @@ impl ReedSolomon {
             .get_mut(..depth * self.min_distance)
             .ok_or(RsError::BufferTooSmall)?;
         let msg = msg.into_iter();
+        if let (Some(kernel), true) = (&self.kernel, depth <= Self::MAX_FAST_DEPTH) {
+            return self.encode_parity_interleaved_with_kernel(kernel, depth, msg, parity);
+        }
         let count = if depth <= Self::MAX_FAST_DEPTH {
             match self.min_distance {
                 32 => self.lfsr_interleaved_fixed::<32>(depth, msg, parity)?,
@@ -366,6 +423,40 @@ impl ReedSolomon {
         }
         if count / depth > self.message_length {
             return Err(RsError::MessageTooLong);
+        }
+        Ok(count)
+    }
+
+    /// [`Self::encode_parity_interleaved`] with the SIMD kernel: the
+    /// message is collected into a stack buffer, then each codeword is
+    /// multiplied with `parity_matrix`, reading its symbols in place.
+    fn encode_parity_interleaved_with_kernel(
+        &self,
+        kernel: &simd::Kernel,
+        depth: usize,
+        msg: impl Iterator<Item = u8>,
+        parity: &mut [u8],
+    ) -> Result<usize, RsError> {
+        let mut buf = [0u8; Self::MAX_FAST_DEPTH * 256];
+        let buf_len = depth * self.message_length;
+        let mut count = 0;
+        for m in msg {
+            if count == buf_len {
+                return Err(RsError::MessageTooLong);
+            }
+            buf[count] = m;
+            count += 1;
+        }
+        if !count.is_multiple_of(depth) {
+            return Err(RsError::InvalidInterleavingDepth);
+        }
+        let mut codeword_parity = [0u8; 256];
+        for j in 0..depth {
+            let column = buf[..count].get(j..).unwrap_or_default();
+            self.parity_with_kernel(kernel, column, depth, &mut codeword_parity);
+            for (p, &sym) in codeword_parity[..self.min_distance].iter().enumerate() {
+                parity[p * depth + j] = sym;
+            }
         }
         Ok(count)
     }
@@ -525,113 +616,7 @@ impl ReedSolomon {
     /// Returns the number of bytes written to `msg`,
     /// `encoded.len() - min_distance()`.
     pub fn decode(&mut self, encoded: &[u8], msg: &mut [u8]) -> Result<usize, RsError> {
-        if encoded.len() > self.block_length {
-            return Err(RsError::EncodedTooLong);
-        }
-        if encoded.len() < self.min_distance {
-            return Err(RsError::EncodedTooShort);
-        }
-        let msg_length = encoded.len() - self.min_distance;
-        if msg.len() < msg_length {
-            return Err(RsError::BufferTooSmall);
-        }
-
-        // Undo encode()'s high-to-low reversal, and zero-fill the
-        // (unshortened) padding region above the message -- the mirror
-        // image of encode()'s own setup.
-        for (dst, &src) in self.received_polynomial[..encoded.len()]
-            .iter_mut()
-            .zip(encoded.iter().rev())
-        {
-            if src > self.field.largest_element() {
-                return Err(RsError::InvalidSymbol);
-            }
-            *dst = src;
-        }
-        for slot in self.received_polynomial[encoded.len()..self.block_length].iter_mut() {
-            *slot = 0;
-        }
-
-        let all_zero = find_syndromes(
-            &self.field,
-            &self.received_polynomial,
-            &self.generator_root_exp,
-            &mut self.syndromes,
-        );
-        if all_zero {
-            // All syndromes are 0, so the received block is already a
-            // valid codeword: no error occurred (or, vanishingly
-            // unlikely, one did but happened to land exactly on another
-            // valid codeword). Nothing to correct.
-            for (dst, &src) in msg[..msg_length]
-                .iter_mut()
-                .zip(self.received_polynomial[..encoded.len()].iter().rev())
-            {
-                *dst = src;
-            }
-            return Ok(msg_length);
-        }
-
-        let order = berlekamp_massey::find_error_locator(
-            &self.field,
-            &self.syndromes,
-            0,
-            &mut self.error_locator,
-            &mut self.last_error_locator,
-        );
-
-        // Log form of the locator, for the Chien search below (see
-        // polynomial::eval_log_lut's docs for why 0 safely doubles as
-        // "no term here" in this form).
-        for i in 0..=order {
-            self.error_locator_log[i] = self.field.log_table()[self.error_locator[i] as usize];
-        }
-
-        if !chien::factorize_error_locator(
-            &self.field,
-            0,
-            &self.error_locator_log[..=order],
-            &mut self.error_roots,
-            &self.element_exp,
-        ) {
-            // Berlekamp-Massey built a locator that's consistent with
-            // the syndromes but doesn't fully factor over this field:
-            // there were too many errors to recover from.
-            return Err(RsError::TooManyErrors);
-        }
-
-        chien::find_error_locations(
-            &self.field,
-            self.generator_root_gap,
-            &self.error_roots[..order],
-            &mut self.error_locations[..order],
-        );
-
-        forney::find_error_values(
-            &self.field,
-            &self.error_locator[..=order],
-            &self.syndromes,
-            &self.error_roots[..order],
-            self.first_consecutive_root,
-            &self.element_exp,
-            &mut self.error_evaluator,
-            &mut self.error_locator_derivative[..order],
-            &mut self.error_vals[..order],
-        );
-
-        for i in 0..order {
-            let location = self.error_locations[i] as usize;
-            self.received_polynomial[location] =
-                self.field.sub(self.received_polynomial[location], self.error_vals[i]);
-        }
-
-        for (dst, &src) in msg[..msg_length]
-            .iter_mut()
-            .zip(self.received_polynomial[..encoded.len()].iter().rev())
-        {
-            *dst = src;
-        }
-        Ok(msg_length)
+        self.decode_with_erasures(encoded, &[], msg)
     }
 
     /// Like [`ReedSolomon::decode`], but additionally accepts
@@ -657,9 +642,6 @@ impl ReedSolomon {
         erasure_locations: &[u8],
         msg: &mut [u8],
     ) -> Result<usize, RsError> {
-        if erasure_locations.is_empty() {
-            return self.decode(encoded, msg);
-        }
         if encoded.len() > self.block_length {
             return Err(RsError::EncodedTooLong);
         }
@@ -669,36 +651,206 @@ impl ReedSolomon {
         if erasure_locations.len() > self.min_distance {
             return Err(RsError::TooManyErasures);
         }
-        let msg_length = encoded.len() - self.min_distance;
+        let len = encoded.len();
+        let msg_length = len - self.min_distance;
         if msg.len() < msg_length {
             return Err(RsError::BufferTooSmall);
         }
-        let erasure_length = erasure_locations.len();
-
-        // Same setup as decode(): undo the high-to-low reversal, and
-        // zero-fill the (unshortened) padding region.
-        for (dst, &src) in self.received_polynomial[..encoded.len()]
-            .iter_mut()
-            .zip(encoded.iter().rev())
-        {
-            if src > self.field.largest_element() {
-                return Err(RsError::InvalidSymbol);
-            }
-            *dst = src;
+        if erasure_locations.iter().any(|&loc| loc as usize >= len) {
+            return Err(RsError::InvalidErasureLocation);
         }
-        for slot in self.received_polynomial[encoded.len()..self.block_length].iter_mut() {
-            *slot = 0;
+
+        let (received_msg, received_parity) = encoded.split_at(msg_length);
+        let has_errors = self.compute_remainder(received_msg, received_parity)?;
+        msg[..msg_length].copy_from_slice(received_msg);
+        if has_errors {
+            let count = self.correct(len, erasure_locations)?;
+            for (&position, &value) in self.error_locations[..count].iter().zip(&self.error_vals) {
+                // Corrections of parity symbols are not needed.
+                if let Some(sym) = msg[..msg_length].get_mut(len - 1 - position as usize) {
+                    *sym ^= value;
+                }
+            }
+        }
+        Ok(msg_length)
+    }
+
+    /// Decodes `depth` interleaved codewords as
+    /// [`crate::ccsds::tm_channel_coding::decode_interleaved`] describes
+    /// (which checks `depth` and the lengths before calling this).
+    ///
+    /// The remainders of all codewords are computed in a single pass with
+    /// [`ReedSolomon::encode_parity_interleaved`], and only codewords
+    /// with a nonzero remainder are decoded further.
+    pub(crate) fn decode_interleaved(
+        &mut self,
+        depth: usize,
+        encoded: &[u8],
+        msg: &mut [u8],
+    ) -> Result<usize, RsError> {
+        let len = encoded.len() / depth;
+        if len > self.block_length {
+            return Err(RsError::EncodedTooLong);
+        }
+        let n = self.min_distance;
+        let msg_len = (len - n) * depth;
+        let (received_msg, received_parity) = encoded.split_at(msg_len);
+        let largest = self.field.largest_element();
+        if received_parity.iter().any(|&sym| sym > largest) {
+            return Err(RsError::InvalidSymbol);
+        }
+
+        let mut parity = core::mem::take(&mut self.interleaved_parity);
+        parity.resize(depth * n, 0);
+        let result = self.decode_interleaved_with(depth, len, received_msg, received_parity, &mut parity, msg);
+        self.interleaved_parity = parity;
+        result.map(|()| msg_len)
+    }
+
+    fn decode_interleaved_with(
+        &mut self,
+        depth: usize,
+        len: usize,
+        received_msg: &[u8],
+        received_parity: &[u8],
+        parity: &mut [u8],
+        msg: &mut [u8],
+    ) -> Result<(), RsError> {
+        let n = self.min_distance;
+        if self.kernel.is_none() {
+            self.encode_parity_interleaved(depth, received_msg.iter().copied(), parity)?;
+        }
+        let msg = &mut msg[..received_msg.len()];
+        msg.copy_from_slice(received_msg);
+        for j in 0..depth {
+            // This codeword's recomputed parity, as `parity[p * step + offset]`.
+            let (step, offset) = match &self.kernel {
+                Some(kernel) => {
+                    let column = received_msg.get(j..).unwrap_or_default();
+                    self.parity_with_kernel(kernel, column, depth, parity);
+                    (1, 0)
+                }
+                None => (depth, j),
+            };
+            let mut has_errors = false;
+            for (p, rem) in self.remainder.iter_mut().enumerate() {
+                *rem = parity[p * step + offset] ^ received_parity[p * depth + j];
+                has_errors |= *rem != 0;
+            }
+            if !has_errors {
+                continue;
+            }
+            let count = self.correct(len, &[])?;
+            for (&position, &value) in self.error_locations[..count].iter().zip(&self.error_vals) {
+                let i = len - 1 - position as usize;
+                if i < len - n {
+                    msg[i * depth + j] ^= value;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Switches the SIMD kernel to `tier`. Returns `false` (and changes
+    /// nothing) if the tier isn't available or this isn't a GF(256) code.
+    #[cfg(any(test, feature = "bench-internals"))]
+    fn set_tier(&mut self, tier: simd::Tier) -> bool {
+        if tier == simd::Tier::Scalar {
+            self.kernel = None;
+            return true;
+        }
+        if self.syndrome_matrix.is_empty() {
+            return false;
+        }
+        match simd::Kernel::new(&self.field, tier) {
+            Some(kernel) => {
+                self.kernel = Some(kernel);
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    fn tier(&self) -> simd::Tier {
+        self.kernel.as_ref().map_or(simd::Tier::Scalar, |k| k.tier())
+    }
+
+    // The decode stages (exposed one by one to the benchmarks with the
+    // `bench-internals` feature). Codeword positions are polynomial
+    // coefficient indices: position `p` of a `len` symbol codeword is
+    // `encoded[len - 1 - p]`.
+
+    /// The parity of the message `msg[0], msg[step], msg[2 * step], ...`
+    /// (at most `message_length()` symbols, all valid in GF(256)) as the
+    /// message times `parity_matrix`.
+    fn parity_with_kernel(&self, kernel: &simd::Kernel, msg: &[u8], step: usize, parity: &mut [u8]) {
+        let len = msg.len().div_ceil(step);
+        if len == 0 {
+            parity[..self.min_distance].fill(0);
+            return;
+        }
+        let first_row = self.message_length - len;
+        let rows = &self.parity_matrix[first_row * self.row_width..];
+        let mut out = [0u8; simd::BLOCK];
+        for (b, chunk) in parity[..self.min_distance].chunks_mut(simd::BLOCK).enumerate() {
+            kernel.mul_acc(msg, step, &rows[b * simd::BLOCK..], self.row_width, &mut out);
+            chunk.copy_from_slice(&out[..chunk.len()]);
+        }
+    }
+
+    /// Computes the remainder of the received codeword modulo the
+    /// generator into `remainder`, with the encoder's LFSR: the parity
+    /// the received message should have, minus the received parity.
+    /// Returns whether it is nonzero, i.e. whether there are errors.
+    fn compute_remainder(&mut self, received_msg: &[u8], received_parity: &[u8]) -> Result<bool, RsError> {
+        let largest = self.field.largest_element();
+        if received_parity.iter().any(|&sym| sym > largest) {
+            return Err(RsError::InvalidSymbol);
+        }
+        let mut remainder = core::mem::take(&mut self.remainder);
+        let result = match &self.kernel {
+            Some(kernel) => {
+                self.parity_with_kernel(kernel, received_msg, 1, &mut remainder);
+                Ok(received_msg.len())
+            }
+            None => self.encode_parity(received_msg.iter().copied(), &mut remainder),
+        };
+        let mut has_errors = false;
+        for (rem, &sym) in remainder.iter_mut().zip(received_parity) {
+            *rem ^= sym;
+            has_errors |= *rem != 0;
+        }
+        self.remainder = remainder;
+        result.map(|_| has_errors)
+    }
+
+    /// Finds the errors (and erasures) of a `len` symbol codeword from
+    /// its nonzero `remainder`, leaving their positions in
+    /// `error_locations` and their values in `error_vals`. Returns how
+    /// many there are.
+    fn correct(&mut self, len: usize, erasure_locations: &[u8]) -> Result<usize, RsError> {
+        self.compute_syndromes();
+        let erasure_length = erasure_locations.len();
+        if erasure_length == 0 {
+            let order = self.berlekamp_massey(0);
+            if !self.chien_search(len, 0, order) {
+                // Berlekamp-Massey built a locator that's consistent with
+                // the syndromes but doesn't fully factor over the
+                // codeword's positions: there were too many errors to
+                // recover from.
+                return Err(RsError::TooManyErrors);
+            }
+            self.forney(order, false);
+            return Ok(order);
         }
 
         // Map each erasure's byte index (in encoded's high-to-low byte
-        // order) to the low-to-high polynomial coefficient index used
-        // internally, then convert those positions into error roots and
-        // multiply them out into the erasure locator polynomial.
-        for (i, &loc) in erasure_locations.iter().enumerate() {
-            if loc as usize >= encoded.len() {
-                return Err(RsError::InvalidErasureLocation);
-            }
-            self.error_locations[i] = (encoded.len() - 1 - loc as usize) as u8;
+        // order) to its codeword position, then convert those positions
+        // into error roots and multiply them out into the erasure
+        // locator polynomial.
+        for (position, &loc) in self.error_locations.iter_mut().zip(erasure_locations) {
+            *position = (len - 1 - loc as usize) as u8;
         }
         chien::find_error_roots_from_locations(
             &self.field,
@@ -712,24 +864,6 @@ impl ReedSolomon {
             &mut self.erasure_locator[..=erasure_length],
             &mut self.init_from_roots_scratch,
         );
-
-        let all_zero = find_syndromes(
-            &self.field,
-            &self.received_polynomial,
-            &self.generator_root_exp,
-            &mut self.syndromes,
-        );
-        if all_zero {
-            // The received block is already a valid codeword, whatever
-            // was flagged as erased notwithstanding.
-            for (dst, &src) in msg[..msg_length]
-                .iter_mut()
-                .zip(self.received_polynomial[..encoded.len()].iter().rev())
-            {
-                *dst = src;
-            }
-            return Ok(msg_length);
-        }
 
         // The modified-syndrome technique: multiplying the syndrome
         // polynomial by the (already-known) erasure locator produces a
@@ -751,27 +885,11 @@ impl ReedSolomon {
             self.syndromes[i] = self.modified_syndromes[erasure_length + i];
         }
 
-        let order = berlekamp_massey::find_error_locator(
-            &self.field,
-            &self.syndromes,
-            erasure_length,
-            &mut self.error_locator,
-            &mut self.last_error_locator,
-        );
-
-        for i in 0..=order {
-            self.error_locator_log[i] = self.field.log_table()[self.error_locator[i] as usize];
-        }
-
-        if !chien::factorize_error_locator(
-            &self.field,
-            erasure_length,
-            &self.error_locator_log[..=order],
-            &mut self.error_roots,
-            &self.element_exp,
-        ) {
-            // Consistent with too-many-errors detection in decode():
-            // the found root count didn't match the locator's degree.
+        let order = self.berlekamp_massey(erasure_length);
+        if !self.chien_search(len, erasure_length, order) {
+            // Consistent with too-many-errors detection without
+            // erasures: the found root count didn't match the locator's
+            // degree.
             return Err(RsError::TooManyErrors);
         }
 
@@ -786,66 +904,219 @@ impl ReedSolomon {
             &mut self.combined_locator[..=combined_order],
         );
 
-        chien::find_error_locations(
-            &self.field,
-            self.generator_root_gap,
-            &self.error_roots[..combined_order],
-            &mut self.error_locations[..combined_order],
-        );
-
         // Restore the real syndromes before Forney's algorithm, which
         // needs them (not the modified ones used above).
         self.syndromes.copy_from_slice(&self.syndrome_snapshot);
 
+        self.forney(combined_order, true);
+        Ok(combined_order)
+    }
+
+    /// Computes the syndromes from `remainder`: `R(x) = r(x) mod g(x)`
+    /// and every generator root is a root of `g(x)`, so the received
+    /// polynomial `r` and `R` agree at the generator roots. This takes
+    /// `min_distance()` terms per syndrome instead of `block_length()`.
+    fn compute_syndromes(&mut self) {
+        if let Some(kernel) = &self.kernel {
+            let mut out = [0u8; simd::BLOCK];
+            for (b, chunk) in self.syndromes.chunks_mut(simd::BLOCK).enumerate() {
+                kernel.mul_acc(&self.remainder, 1, &self.syndrome_matrix[b * simd::BLOCK..], self.row_width, &mut out);
+                chunk.copy_from_slice(&out[..chunk.len()]);
+            }
+            return;
+        }
+        let exp = self.field.exp_table();
+        let log = self.field.log_table();
+        for (syndrome, root_exp) in self.syndromes.iter_mut().zip(&self.syndrome_exp) {
+            let mut acc = 0u8;
+            for (&c, &e) in self.remainder.iter().zip(root_exp) {
+                if c != 0 {
+                    acc ^= exp[log[c as usize] as usize + e as usize];
+                }
+            }
+            *syndrome = acc;
+        }
+    }
+
+    /// Runs Berlekamp-Massey on the syndromes, returning the order of
+    /// the error locator it leaves in `error_locator`.
+    fn berlekamp_massey(&mut self, num_erasures: usize) -> usize {
+        berlekamp_massey::find_error_locator(
+            &self.field,
+            &self.syndromes,
+            num_erasures,
+            &mut self.error_locator,
+            &mut self.last_error_locator,
+        )
+    }
+
+    /// Finds the `order` roots of `error_locator` among the positions of
+    /// a `len` symbol codeword, writing them into `error_roots[num_skip..]`
+    /// and the positions into `error_locations[num_skip..]`. Returns
+    /// whether all of them were found.
+    fn chien_search(&mut self, len: usize, num_skip: usize, order: usize) -> bool {
+        if let Some(kernel) = &self.kernel {
+            if order == 0 {
+                return true;
+            }
+            let locator = &self.error_locator[..=order];
+            let mut found = num_skip;
+            let mut out = [0u8; simd::BLOCK];
+            for start in (0..len).step_by(simd::BLOCK) {
+                let mut zeros = kernel.mul_acc(locator, 1, &self.chien_matrix[start..], CHIEN_WIDTH, &mut out);
+                if len - start < simd::BLOCK {
+                    zeros &= (1u32 << (len - start)) - 1;
+                }
+                while zeros != 0 {
+                    let p = start + zeros.trailing_zeros() as usize;
+                    zeros &= zeros - 1;
+                    self.error_roots[found] = self.chien_matrix[CHIEN_WIDTH + p];
+                    self.error_locations[found] = p as u8;
+                    found += 1;
+                    if found == num_skip + order {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        chien::find_error_positions(
+            &self.field,
+            self.generator_root_gap,
+            len,
+            &self.error_locator[..=order],
+            &mut self.chien_terms,
+            &mut self.error_roots[num_skip..num_skip + order],
+            &mut self.error_locations[num_skip..num_skip + order],
+        )
+    }
+
+    /// Computes the `count` error values with Forney's algorithm, from
+    /// `combined_locator` if `combined` (erasure decoding), otherwise from
+    /// `error_locator`.
+    fn forney(&mut self, count: usize, combined: bool) {
+        let locator = if combined {
+            &self.combined_locator[..=count]
+        } else {
+            &self.error_locator[..=count]
+        };
         forney::find_error_values(
             &self.field,
-            &self.combined_locator[..=combined_order],
+            locator,
             &self.syndromes,
-            &self.error_roots[..combined_order],
+            &self.error_roots[..count],
             self.first_consecutive_root,
             &self.element_exp,
             &mut self.error_evaluator,
-            &mut self.error_locator_derivative[..combined_order],
-            &mut self.error_vals[..combined_order],
+            &mut self.error_locator_derivative[..count],
+            &mut self.error_vals[..count],
         );
-
-        for i in 0..combined_order {
-            let location = self.error_locations[i] as usize;
-            self.received_polynomial[location] =
-                self.field.sub(self.received_polynomial[location], self.error_vals[i]);
-        }
-
-        for (dst, &src) in msg[..msg_length]
-            .iter_mut()
-            .zip(self.received_polynomial[..encoded.len()].iter().rev())
-        {
-            *dst = src;
-        }
-        Ok(msg_length)
     }
 }
 
-/// Evaluates `received` at each of the generator's roots (i.e. computes
-/// the syndromes): because a valid codeword is, by construction, a
-/// multiple of the generator polynomial, it evaluates to 0 at every one
-/// of those roots, so any nonzero syndrome directly reveals the error
-/// polynomial's value there. Returns whether every syndrome was 0 (no
-/// detected error). Ported from `reed_solomon_find_syndromes`.
-fn find_syndromes(
+/// Row width of [`ReedSolomon::chien_matrix`]: every position of a
+/// GF(256) codeword, rounded up to whole blocks.
+const CHIEN_WIDTH: usize = 256;
+
+/// Builds the syndrome, parity and Chien matrices of a GF(256) code
+/// (see the [`ReedSolomon`] fields of the same names).
+fn build_simd_matrices(
     field: &GaloisField,
-    received: &[u8],
-    generator_root_exp: &[Vec<u8>],
-    syndromes: &mut [u8],
-) -> bool {
-    let mut all_zero = true;
-    for (syndrome, root_exp) in syndromes.iter_mut().zip(generator_root_exp.iter()) {
-        let eval = polynomial::eval_lut(field, received, root_exp);
-        if eval != 0 {
-            all_zero = false;
+    generator_roots: &[u8],
+    encode_table: &[u8],
+    generator_root_gap: u8,
+    row_width: usize,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let n = generator_roots.len();
+    let block_length = field.largest_element() as usize;
+    let message_length = block_length - n;
+
+    let mut syndrome_matrix = vec![0u8; n * row_width];
+    for (j, row) in syndrome_matrix.chunks_exact_mut(row_width).enumerate() {
+        for (sym, &root) in row.iter_mut().zip(generator_roots) {
+            *sym = field.pow(root, (n - 1 - j) as i32);
         }
-        *syndrome = eval;
     }
-    all_zero
+
+    // The parity of a single 1 followed by `u` zeros, for growing `u`,
+    // by running the encoder's LFSR on zeros.
+    let mut parity_matrix = vec![0u8; message_length * row_width];
+    let mut reg = encode_table[n..2 * n].to_vec(); // after feeding 1
+    for u in 0..message_length {
+        let r = message_length - 1 - u;
+        parity_matrix[r * row_width..r * row_width + n].copy_from_slice(&reg);
+        let fb = reg[0] as usize;
+        reg.copy_within(1.., 0);
+        reg[n - 1] = 0;
+        for (r, g) in reg.iter_mut().zip(&encode_table[fb * n..(fb + 1) * n]) {
+            *r ^= g;
+        }
+    }
+
+    let largest = field.largest_element() as usize;
+    let mut chien_matrix = vec![0u8; (n + 1) * CHIEN_WIDTH];
+    for p in 0..block_length {
+        let x = field.exp_table()[(largest - generator_root_gap as usize * p % largest) % largest];
+        let mut power = 1u8;
+        for t in 0..=n {
+            chien_matrix[t * CHIEN_WIDTH + p] = power;
+            power = field.mul(power, x);
+        }
+    }
+    (syndrome_matrix, parity_matrix, chien_matrix)
+}
+
+/// The decode stages one by one, for the `decode_stages` benchmark. Not
+/// a stable API.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod bench_internals {
+    use super::ReedSolomon;
+    use crate::error::RsError;
+    pub use super::simd::Tier;
+
+    /// Switches `rs` to the SIMD `tier`. Returns `false` (and changes
+    /// nothing) if the tier isn't available or `rs` isn't a GF(256) code.
+    pub fn set_tier(rs: &mut ReedSolomon, tier: Tier) -> bool {
+        rs.set_tier(tier)
+    }
+
+    pub fn tier(rs: &ReedSolomon) -> Tier {
+        rs.tier()
+    }
+
+    /// Runs the stages of [`ReedSolomon::decode`] on `rs`'s internal
+    /// state. Each stage expects the previous ones to have run.
+    pub struct Stages<'a> {
+        rs: &'a mut ReedSolomon,
+        len: usize,
+    }
+
+    impl<'a> Stages<'a> {
+        pub fn new(rs: &'a mut ReedSolomon) -> Self {
+            Stages { rs, len: 0 }
+        }
+        /// The remainder of `encoded`. Returns whether it is nonzero.
+        pub fn remainder(&mut self, encoded: &[u8]) -> Result<bool, RsError> {
+            self.len = encoded.len();
+            let (msg, parity) = encoded.split_at(encoded.len() - self.rs.min_distance);
+            self.rs.compute_remainder(msg, parity)
+        }
+        pub fn syndromes(&mut self) {
+            self.rs.compute_syndromes()
+        }
+        /// Returns the order of the error locator.
+        pub fn berlekamp_massey(&mut self) -> usize {
+            self.rs.berlekamp_massey(0)
+        }
+        /// Returns whether all `order` roots were found.
+        pub fn chien(&mut self, order: usize) -> bool {
+            self.rs.chien_search(self.len, 0, order)
+        }
+        pub fn forney(&mut self, order: usize) {
+            self.rs.forney(order, false)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1059,6 +1330,141 @@ mod tests {
             let mut parity = vec![0u8; min_distance];
             prop_assert_eq!(rs.encode_parity(msg.iter().copied(), &mut parity), Ok(msg.len()));
             prop_assert_eq!(&parity, &reference_parity(&rs, &msg));
+        }
+    }
+
+    proptest! {
+        /// Every SIMD tier this machine has gives exactly the scalar
+        /// results, errors included, for errors and erasures within and
+        /// beyond the correction capacity.
+        #[test]
+        fn every_simd_tier_matches_scalar(
+            min_distance_sel in 0usize..5,
+            fcr in 0u8..=255,
+            gap in prop::sample::select(vec![1u8, 11, 13]),
+            msg_len_sel in 0usize..=1000,
+            depth in 1usize..=8,
+            raw_msg in proptest::collection::vec(any::<u8>(), 8 * 255),
+            num_errors in 0usize..=24,
+            num_erasures in 0usize..=24,
+            raw_positions in proptest::collection::vec(any::<u16>(), 48),
+            values in proptest::collection::vec(1u8..=255, 48),
+        ) {
+            let min_distance = [32, 16, 4, 10, 40][min_distance_sel];
+            let mut rs = ReedSolomon::new(POLY_GF256, fcr, gap, min_distance).unwrap();
+            let msg_len = msg_len_sel * rs.message_length() / 1000;
+            let len = msg_len + min_distance;
+            let msg = &raw_msg[..msg_len];
+            let mut encoded = vec![0u8; len];
+            prop_assert!(rs.set_tier(simd::Tier::Scalar));
+            rs.encode(msg, &mut encoded).unwrap();
+
+            // Distinct error positions, the first `num_erasures` of
+            // them also reported as erasures.
+            let mut positions: Vec<u8> = Vec::new();
+            for &raw in &raw_positions {
+                let p = (raw as usize % len) as u8;
+                if !positions.contains(&p) {
+                    positions.push(p);
+                }
+            }
+            let num_errors = num_errors.min(positions.len());
+            let num_erasures = num_erasures.min(num_errors).min(min_distance);
+            for (&p, &v) in positions[..num_errors].iter().zip(&values) {
+                encoded[p as usize] ^= v;
+            }
+            let erasures = &positions[..num_erasures];
+
+            let interleaved_msg = &raw_msg[..msg_len * depth];
+            let mut interleaved = vec![0u8; len * depth];
+            let mut parity = vec![0u8; min_distance * depth];
+            for (i, &v) in values.iter().enumerate() {
+                let p = raw_positions[i] as usize % interleaved.len();
+                interleaved[p] ^= v;
+            }
+
+            let run = |rs: &mut ReedSolomon, parity: &mut [u8], interleaved: &mut [u8]| {
+                let mut out = vec![0u8; msg_len];
+                let decoded = rs.decode_with_erasures(&encoded, erasures, &mut out);
+                let decoded = decoded.map(|n| out[..n].to_vec());
+                let mut single = vec![0u8; min_distance];
+                let encoded_parity = rs.encode_parity(msg.iter().copied(), &mut single).map(|_| single);
+                let interleaved_ok = rs.encode_parity_interleaved(depth, interleaved_msg.iter().copied(), parity);
+                // An interleaved codeblock with the errors added above.
+                let (m, p) = interleaved.split_at_mut(msg_len * depth);
+                let corrupted_msg = m.to_vec();
+                for (c, &x) in m.iter_mut().zip(interleaved_msg) {
+                    *c ^= x;
+                }
+                for (c, &x) in p.iter_mut().zip(parity.iter()) {
+                    *c ^= x;
+                }
+                let mut out = vec![0u8; msg_len * depth];
+                let interleaved_decoded = rs.decode_interleaved(depth, interleaved, &mut out).map(|_| out);
+                interleaved[..msg_len * depth].copy_from_slice(&corrupted_msg);
+                for (c, &x) in interleaved[msg_len * depth..].iter_mut().zip(parity.iter()) {
+                    *c ^= x;
+                }
+                (decoded, encoded_parity, interleaved_ok, parity.to_vec(), interleaved_decoded)
+            };
+            let expected = run(&mut rs, &mut parity, &mut interleaved);
+            if num_erasures + 2 * (num_errors - num_erasures) < min_distance {
+                prop_assert_eq!(expected.0.as_deref(), Ok(msg));
+            }
+            for tier in simd::Tier::ALL {
+                if !rs.set_tier(tier) {
+                    continue;
+                }
+                prop_assert_eq!(rs.tier(), tier);
+                let got = run(&mut rs, &mut parity, &mut interleaved);
+                prop_assert_eq!(&got, &expected, "{:?}", tier);
+            }
+        }
+    }
+
+    /// The syndromes as libcorrect computes them: the received
+    /// polynomial evaluated at each generator root.
+    fn reference_syndromes(rs: &ReedSolomon, encoded: &[u8]) -> Vec<u8> {
+        let received: Vec<u8> = encoded.iter().rev().copied().collect();
+        rs.generator_roots()
+            .iter()
+            .map(|&root| polynomial::eval(rs.field(), &received, root))
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn syndromes_from_the_remainder_match_direct_evaluation(
+            gf256 in any::<bool>(),
+            min_distance_sel in 0usize..6,
+            fcr in 0u8..=255,
+            gap in 1u8..=15,
+            raw in proptest::collection::vec(any::<u8>(), 1..=255),
+        ) {
+            let (poly, min_distance) = if gf256 {
+                (POLY_GF256, [32, 16, 4, 1, 10, 33][min_distance_sel])
+            } else {
+                (POLY_GF16, [4, 1, 2, 6, 10, 14][min_distance_sel])
+            };
+            let mut rs = ReedSolomon::new(poly, fcr, gap, min_distance).unwrap();
+            let largest = rs.field().largest_element();
+            let encoded: Vec<u8> = raw
+                .iter()
+                .take(rs.block_length())
+                .map(|b| b & largest)
+                .collect();
+            prop_assume!(encoded.len() >= min_distance);
+
+            let (msg, parity) = encoded.split_at(encoded.len() - min_distance);
+            let has_errors = rs.compute_remainder(msg, parity).unwrap();
+            rs.compute_syndromes();
+            let expected = reference_syndromes(&rs, &encoded);
+            prop_assert_eq!(&rs.syndromes, &expected);
+            // (The converse does not hold for codes with repeated
+            // generator roots, see `gap`.)
+            if expected.iter().any(|&s| s != 0) {
+                prop_assert!(has_errors);
+            }
         }
     }
 

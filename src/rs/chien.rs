@@ -1,88 +1,90 @@
 //! Chien search: brute-force root-finding for the error locator
-//! polynomial, plus mapping the roots found back to byte positions in
-//! the codeword. Ported from `reed_solomon_factorize_error_locator` and
-//! `reed_solomon_find_error_locations` in `src/reed-solomon/decode.c`.
-
-use alloc::vec::Vec;
+//! polynomial over the positions of the codeword. Replaces
+//! `reed_solomon_factorize_error_locator` and
+//! `reed_solomon_find_error_locations` in `src/reed-solomon/decode.c`,
+//! which search the whole field and then map each root back to its
+//! position by another search over the field.
 
 use crate::field::GaloisField;
-use crate::polynomial;
 
-/// Finds every root of `locator_log` (the error locator polynomial, in
-/// log-coefficient form -- see [`polynomial::eval_log_lut`]) by brute
-/// force: the field is small enough that just trying every element is
-/// fast, and reliably finds every root, unlike general polynomial
-/// root-finding.
+/// Finds the roots of `locator` (the error locator polynomial, lowest
+/// order coefficient first) among the positions of a `len` symbol
+/// (possibly shortened) codeword: an error at position `p` (polynomial
+/// coefficient index, i.e. `encoded[len - 1 - p]`) makes
+/// `1 / alpha^(generator_root_gap * p)` a root.
 ///
-/// Writes the roots found into `roots[num_skip..]` and returns whether
-/// exactly `locator_log.len() - 1` roots were found (its degree): if
-/// fewer were found, Berlekamp-Massey built a locator that happens to
-/// fit the syndromes but doesn't factor completely, which is how this
-/// crate (like the C it's ported from) detects "too many errors to
+/// Trying every position reliably finds every root, unlike general
+/// polynomial root-finding. The terms `locator[t] * x^t` are carried
+/// from one position to the next in log form, `x` changing by the
+/// constant factor `alpha^-generator_root_gap`, and the search stops as
+/// soon as all roots are found.
+///
+/// Writes the roots found into `roots` and their positions into
+/// `positions` (both of length `locator.len() - 1`) and returns whether
+/// all `locator.len() - 1` (its degree) roots were found: if fewer
+/// were, Berlekamp-Massey built a locator that happens to fit the
+/// syndromes but doesn't factor completely (or has roots outside the
+/// codeword), which is how this crate detects "too many errors to
 /// recover from" rather than silently returning a wrong answer.
 ///
-/// `num_skip` reserves the first `num_skip` slots of `roots` for the
-/// erasure locator's roots, filled in separately by the erasure-decoding
-/// path (phase 5); pass `0` for the plain (no-erasures) decode path.
-/// `element_exp[e]` must hold the successive log-powers of field element
-/// `e`, at least `locator_log.len()` of them (see
-/// [`polynomial::build_exp_lut`]).
-pub(crate) fn factorize_error_locator(
-    field: &GaloisField,
-    num_skip: usize,
-    locator_log: &[u8],
-    roots: &mut [u8],
-    element_exp: &[Vec<u8>],
-) -> bool {
-    let order = locator_log.len() - 1;
-    let mut found = num_skip;
-    for slot in roots[num_skip..num_skip + order].iter_mut() {
-        *slot = 0;
-    }
-    for (i, exp) in element_exp.iter().enumerate().take(field.field_size() as usize) {
-        if polynomial::eval_log_lut(field, locator_log, &exp[..locator_log.len()]) == 0 {
-            roots[found] = i as u8;
-            found += 1;
-        }
-    }
-    found == order + num_skip
-}
-
-/// Converts the error locator's roots (found by [`factorize_error_locator`])
-/// into byte positions within the codeword, writing them into
-/// `error_locations`.
-///
-/// An error root is the *reciprocal* of `alpha^(generator_root_gap * location)`,
-/// so recovering `location` means dividing it back out and then searching
-/// for which power of `alpha^generator_root_gap` produced it -- again by
-/// brute force over the field, same as the root search itself.
-///
-/// A root of exactly `0` is skipped (left unwritten) as a defensive
-/// no-op: `0` can never actually be a root of the error locator (its
-/// constant term is always `1`, by construction -- see
-/// `berlekamp_massey`'s docs), so this only matters if it's ever called
-/// with the buffer in an inconsistent state.
-pub(crate) fn find_error_locations(
+/// `terms` is scratch space of at least `locator.len()` entries.
+pub(crate) fn find_error_positions(
     field: &GaloisField,
     generator_root_gap: u8,
-    error_roots: &[u8],
-    error_locations: &mut [u8],
-) {
-    for (location, &root) in error_locations.iter_mut().zip(error_roots.iter()) {
-        if root == 0 {
-            continue;
-        }
-        let target = field.div(1, root);
-        for j in 0..field.field_size() as usize {
-            if field.pow(j as u8, generator_root_gap as i32) == target {
-                *location = field.log_table()[j];
-                break;
-            }
+    len: usize,
+    locator: &[u8],
+    terms: &mut [[u8; 2]],
+    roots: &mut [u8],
+    positions: &mut [u8],
+) -> bool {
+    let order = locator.len() - 1;
+    if order == 0 {
+        return true;
+    }
+    let largest = field.largest_element() as u16;
+    let exp = field.exp_table();
+    let log = field.log_table();
+    // log(alpha^-generator_root_gap)
+    let step = (largest - generator_root_gap as u16 % largest) % largest;
+
+    // (log(locator[t] * x^t), log of its factor to the next position)
+    // per nonzero term, starting at position 0 (x = 1). Logs stay in
+    // 0..=largest, where both ends mean 1.
+    let mut num_terms = 0;
+    for (t, &c) in locator.iter().enumerate() {
+        if c != 0 {
+            terms[num_terms] = [log[c as usize], ((t as u32 * step as u32) % largest as u32) as u8];
+            num_terms += 1;
         }
     }
+    let terms = &mut terms[..num_terms];
+
+    let mut found = 0;
+    let mut x_log = 0u16;
+    for p in 0..len {
+        let mut sum = 0u8;
+        for [term_log, term_step] in terms.iter_mut() {
+            sum ^= exp[*term_log as usize];
+            let next = *term_log as u16 + *term_step as u16;
+            *term_log = if next >= largest { next - largest } else { next } as u8;
+        }
+        if sum == 0 {
+            roots[found] = exp[x_log as usize];
+            positions[found] = p as u8;
+            found += 1;
+            if found == order {
+                return true;
+            }
+        }
+        x_log += step;
+        if x_log >= largest {
+            x_log -= largest;
+        }
+    }
+    false
 }
 
-/// The inverse of [`find_error_locations`]: given known codeword
+/// The inverse of [`find_error_positions`]' position mapping: given known codeword
 /// positions (erasures, whose locations the receiver already knows by
 /// some means outside this codec -- e.g. from a demodulator's confidence
 /// signal), computes the error roots those positions correspond to, so
@@ -91,8 +93,7 @@ pub(crate) fn find_error_locations(
 ///
 /// A codeword position `p` and its corresponding root are related by
 /// `root = 1 / alpha^(generator_root_gap * p)`; recovering `root` from
-/// `p` is thus direct exponentiation, unlike `find_error_locations`'s
-/// brute-force search in the other direction.
+/// `p` is thus direct exponentiation.
 pub(crate) fn find_error_roots_from_locations(
     field: &GaloisField,
     generator_root_gap: u8,
@@ -109,44 +110,44 @@ pub(crate) fn find_error_roots_from_locations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::polynomial;
     use alloc::vec;
 
     const POLY_GF16: u16 = 0x13;
+    const POLY_GF256: u16 = 0x187;
 
-    fn build_element_exp(field: &GaloisField, width: usize) -> Vec<Vec<u8>> {
-        (0..field.field_size())
-            .map(|e| {
-                let mut lut = vec![0u8; width];
-                polynomial::build_exp_lut(field, e as u8, &mut lut);
-                lut
-            })
-            .collect()
+    fn search(gf: &GaloisField, gap: u8, len: usize, locator: &[u8]) -> Option<(vec::Vec<u8>, vec::Vec<u8>)> {
+        let order = locator.len() - 1;
+        let mut terms = vec![[0u8; 2]; locator.len()];
+        let mut roots = vec![0u8; order];
+        let mut positions = vec![0u8; order];
+        find_error_positions(gf, gap, len, locator, &mut terms, &mut roots, &mut positions)
+            .then_some((roots, positions))
     }
 
     #[test]
-    fn finds_the_known_roots_of_a_product_of_linear_factors() {
-        let gf = GaloisField::new(POLY_GF16);
-        // Lambda(x) = (1 + r1*x)(1 + r2*x), roots are 1/r1 and 1/r2.
-        let r1 = gf.exp_table()[3];
-        let r2 = gf.exp_table()[7];
-        let root1 = gf.div(1, r1);
-        let root2 = gf.div(1, r2);
-        let locator = polynomial::from_roots(&gf, &[root1, root2]);
-        let locator_log: Vec<u8> = locator
-            .iter()
-            .map(|&c| gf.log_table()[c as usize])
-            .collect();
+    fn finds_the_roots_and_positions_of_a_product_of_linear_factors() {
+        for (poly, gap, len) in [(POLY_GF16, 1u8, 15usize), (POLY_GF256, 11, 255), (POLY_GF256, 11, 40)] {
+            let gf = GaloisField::new(poly);
+            let error_positions = [3u8, 7, (len - 1) as u8];
+            let mut roots = [0u8; 3];
+            find_error_roots_from_locations(&gf, gap, &error_positions, &mut roots);
+            let locator = polynomial::from_roots(&gf, &roots);
 
-        let element_exp = build_element_exp(&gf, locator_log.len());
-        let mut roots = vec![0u8; 2];
-        let ok = factorize_error_locator(&gf, 0, &locator_log, &mut roots, &element_exp);
+            let (found_roots, found_positions) = search(&gf, gap, len, &locator).expect("all roots found");
+            assert_eq!(found_positions, error_positions, "poly {poly:#x} len {len}");
+            assert_eq!(found_roots, roots, "poly {poly:#x} len {len}");
+        }
+    }
 
-        assert!(ok);
-        let mut found = roots.clone();
-        found.sort_unstable();
-        let mut expected = [root1, root2];
-        expected.sort_unstable();
-        assert_eq!(found, expected);
+    #[test]
+    fn roots_outside_a_shortened_codeword_are_not_found() {
+        let gf = GaloisField::new(POLY_GF256);
+        let mut roots = [0u8; 2];
+        find_error_roots_from_locations(&gf, 11, &[5, 100], &mut roots);
+        let locator = polynomial::from_roots(&gf, &roots);
+        assert!(search(&gf, 11, 101, &locator).is_some());
+        assert!(search(&gf, 11, 100, &locator).is_none());
     }
 
     #[test]
@@ -170,46 +171,23 @@ mod tests {
             })
             .expect("GF(16) must contain at least one irreducible quadratic");
 
-        let locator_log: Vec<u8> = locator
-            .iter()
-            .map(|&c| gf.log_table()[c as usize])
-            .collect();
-        let element_exp = build_element_exp(&gf, locator_log.len());
-        let mut roots = vec![0u8; 2];
-        let ok = factorize_error_locator(&gf, 0, &locator_log, &mut roots, &element_exp);
-        assert!(!ok, "expected this quadratic to not fully factor over GF(16)");
+        assert!(
+            search(&gf, 1, 15, &locator).is_none(),
+            "expected this quadratic to not fully factor over GF(16)"
+        );
     }
 
     #[test]
-    fn find_error_locations_inverts_the_root_construction() {
+    fn find_error_roots_from_locations_matches_the_root_construction() {
         let gf = GaloisField::new(POLY_GF16);
         let generator_root_gap = 1u8;
         // An error at codeword position `location` produces a root of
-        // 1 / alpha^(generator_root_gap * location) -- mirror that here
-        // and check find_error_locations recovers `location`.
+        // 1 / alpha^(generator_root_gap * location).
         for location in 0u8..15 {
             let power = gf.exp_table()[(generator_root_gap as usize * location as usize) % gf.largest_element() as usize];
-            let root = gf.div(1, power);
-            let mut locations = [0u8];
-            find_error_locations(&gf, generator_root_gap, &[root], &mut locations);
-            assert_eq!(locations[0], location, "mismatch for location {location}");
-        }
-    }
-
-    #[test]
-    fn find_error_roots_from_locations_is_the_exact_inverse_of_find_error_locations() {
-        let gf = GaloisField::new(POLY_GF16);
-        let generator_root_gap = 1u8;
-        for location in 0u8..15 {
             let mut roots = [0u8];
             find_error_roots_from_locations(&gf, generator_root_gap, &[location], &mut roots);
-
-            let mut recovered_location = [0u8];
-            find_error_locations(&gf, generator_root_gap, &roots, &mut recovered_location);
-            assert_eq!(
-                recovered_location[0], location,
-                "round trip failed for location {location}"
-            );
+            assert_eq!(roots[0], gf.div(1, power), "mismatch for location {location}");
         }
     }
 }

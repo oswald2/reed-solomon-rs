@@ -18,6 +18,11 @@ default = []
 # Enables std::error::Error impls and anything else that needs libstd.
 # The crate itself is no_std + alloc regardless of this feature.
 std = []
+# Exposes the individual decode stages to the `decode_stages` benchmark.
+# Not a stable API.
+bench-internals = []
+# Never uses the SIMD kernels, to test the scalar code on any machine.
+force-scalar = []
 
 [dependencies]
 
@@ -28,3 +33,8 @@ criterion = "0.8.2"
 [[bench]]
 name = "rs_benchmarks"
 harness = false
+
+[[bench]]
+name = "decode_stages"
+harness = false
+required-features = ["bench-internals"]

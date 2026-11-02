@@ -62,6 +62,42 @@ fn bench_gf256_255_223(c: &mut Criterion) {
     group.finish();
 }
 
+/// A CADU-sized codeblock: 1115 message bytes at E=16, interleaving
+/// depth 5, as in space-rs.
+fn bench_tm_e16_i5(c: &mut Criterion) {
+    const DEPTH: usize = 5;
+    let mut rs = tm_channel_coding::codec_e16();
+    let msg: Vec<u8> = (0..1115).map(|i| (i * 7 + 3) as u8).collect();
+    let mut encoded = vec![0u8; 1275];
+    tm_channel_coding::encode_interleaved(&rs, DEPTH, &msg, &mut encoded).unwrap();
+    // A burst of 80 symbols: 16 errors in each of the 5 codewords.
+    let mut corrupted = encoded.clone();
+    corrupted[..80].iter_mut().for_each(|b| *b = !*b);
+
+    let mut group = c.benchmark_group("tm_e16_i5");
+    let mut out = vec![0u8; 1275];
+    group.bench_function("encode", |b| {
+        b.iter(|| {
+            tm_channel_coding::encode_interleaved(&rs, DEPTH, std::hint::black_box(&msg), &mut out)
+                .unwrap()
+        })
+    });
+    let mut out = vec![0u8; 1115];
+    group.bench_function("decode_no_errors", |b| {
+        b.iter(|| {
+            tm_channel_coding::decode_interleaved(&mut rs, DEPTH, std::hint::black_box(&encoded), &mut out)
+                .unwrap()
+        })
+    });
+    group.bench_function("decode_16_errors_per_codeword", |b| {
+        b.iter(|| {
+            tm_channel_coding::decode_interleaved(&mut rs, DEPTH, std::hint::black_box(&corrupted), &mut out)
+                .unwrap()
+        })
+    });
+    group.finish();
+}
+
 fn bench_ccsds_aos_fhec(c: &mut Criterion) {
     let mut rs: ReedSolomon = fhec::codec();
     let msg = [3u8, 7, 1, 15, 0, 9];
@@ -89,5 +125,5 @@ fn bench_ccsds_aos_fhec(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_gf256_255_223, bench_ccsds_aos_fhec);
+criterion_group!(benches, bench_gf256_255_223, bench_tm_e16_i5, bench_ccsds_aos_fhec);
 criterion_main!(benches);
